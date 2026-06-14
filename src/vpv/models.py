@@ -118,6 +118,7 @@ class TargetResult:
     after: MediaSnapshot | None = None
     selected_video: str | None = None  # which candidate was randomly chosen, if any
     fullscreen: bool | None = None     # whether the page entered fullscreen
+    ad_skipped: bool | None = None     # whether a pre-roll ad was skipped
     error: str | None = None
     attempts: int = 1
     duration_ms: int = 0
@@ -131,6 +132,7 @@ class TargetResult:
             "signals": self.signals,
             "selected_video": self.selected_video,
             "fullscreen": self.fullscreen,
+            "ad_skipped": self.ad_skipped,
             "artifact": self.artifact.to_dict() if self.artifact else None,
             "before": self.before.to_dict() if self.before else None,
             "after": self.after.to_dict() if self.after else None,

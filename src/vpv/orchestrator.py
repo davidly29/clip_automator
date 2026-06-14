@@ -90,8 +90,11 @@ class Orchestrator:
                     url=target.url, passed=False, code=FailureCode.BROWSER_ERROR,
                     reasons=[str(e)], error=str(e), attempts=attempts,
                 )
-                # Restart the browser once, then keep retrying.
-                if not browser_restarted:
+                # Restart the shared browser once — but only when this is the
+                # sole target in flight. With concurrency > 1, closing the browser
+                # would destroy the contexts of other targets mid-capture, so we
+                # just retry with a fresh context instead.
+                if not browser_restarted and self._cfg.concurrency == 1:
                     browser_restarted = True
                     try:
                         await controller.close()
@@ -113,6 +116,7 @@ class Orchestrator:
         rec_t0 = time.monotonic()   # ~when Playwright started recording
         selected_video: str | None = None
         fullscreen_ok: bool | None = None
+        ad_skipped: bool | None = None
         try:
             await controller.goto(page, target.url)
             # Clear any consent / first-visit modal before doing anything else.
@@ -123,8 +127,12 @@ class Orchestrator:
             selected_video = await controller.pick_random_video(page, target, self._rng)
 
             video: VideoHandle = await controller.locate_video(page, target)
-            # Optional play/fullscreen button clicks + fullscreen, then play fallback.
-            fullscreen_ok = await controller.click_controls(page, video, target)
+            # Click play first — on many sites this starts the pre-roll ad — then
+            # skip the ad so capture lands on the real content, not the advert.
+            await controller.click_play(page, target)
+            ad_skipped = await controller.skip_ad(page, target)
+            # Now take the content fullscreen and confirm it's actually playing.
+            fullscreen_ok = await controller.go_fullscreen(page, video, target)
             await controller.try_play(video)
             # Wait until the video is actually rendering (avoids black frames),
             # then an optional warmup to skip a black/ad intro.
@@ -161,6 +169,7 @@ class Orchestrator:
                                         engine, recorded_video=recorded_path,
                                         selected_video=selected_video,
                                         fullscreen=fullscreen_ok,
+                                        ad_skipped=ad_skipped,
                                         clip_start_offset=clip_start_offset,
                                         clip_duration=clip_duration)
             except OSError as e:
@@ -183,6 +192,7 @@ class Orchestrator:
                 after=after,
                 selected_video=selected_video,
                 fullscreen=fullscreen_ok,
+                ad_skipped=ad_skipped,
                 duration_ms=int((time.monotonic() - start) * 1000),
             )
         except VPVError as e:

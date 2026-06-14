@@ -16,9 +16,15 @@ dist/
 .ruff_cache/
 
 # VPV runtime output (proof-of-playback artifacts)
+vpv-artifact/
 vpv-artifacts/
 _smoke*/
 _fs_smoke*/
+
+# Node / frontend build deps (the built SPA in src/vpv/web IS committed)
+node_modules/
+frontend/dist/
+npm-debug.log*
 
 # IDE / editor
 .idea/

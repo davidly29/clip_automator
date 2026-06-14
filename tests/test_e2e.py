@@ -146,7 +146,7 @@ def test_explicit_dismiss_id_with_auto_off(server, tmp_path):
         targets=(TargetConfig(
             url=f"{server}/homepage.html",
             video_selector="#player",
-            dismiss_selector="#accept",
+            dismiss_selectors=("#accept",),
             random_ids=("v2",),
         ),),
         output_dir=tmp_path,
@@ -229,7 +229,8 @@ def test_fullscreen_is_entered(server, tmp_path):
             await ctrl.goto(page, target.url)
             await ctrl.run_interaction(page, target)
             video = await ctrl.locate_video(page, target)
-            await ctrl.click_controls(page, video, target)
+            await ctrl.click_play(page, target)
+            await ctrl.go_fullscreen(page, video, target)
             in_fs = await page.evaluate("() => !!document.fullscreenElement")
             await context.close()
             return in_fs
@@ -262,7 +263,8 @@ def test_fullscreen_target_container(server, tmp_path):
             context, page = await ctrl.new_page()
             await ctrl.goto(page, target.url)
             video = await ctrl.locate_video(page, target)
-            ok = await ctrl.click_controls(page, video, target)
+            await ctrl.click_play(page, target)
+            ok = await ctrl.go_fullscreen(page, video, target)
             fs_id = await page.evaluate(
                 "() => document.fullscreenElement ? document.fullscreenElement.id : null")
             await context.close()
@@ -273,6 +275,59 @@ def test_fullscreen_target_container(server, tmp_path):
     ok, fs_id = asyncio.run(run())
     assert ok is True
     assert fs_id == "wrap"
+
+
+def test_age_gate_random_selector_and_skip_ad(server, tmp_path):
+    """Full adult-site flow: dismiss two <span> gates, randomly open a video_*
+    div, skip the pre-roll ad, then verify the content plays."""
+    import asyncio
+    target = TargetConfig(
+        url=f"{server}/age_gated_site.html",
+        dismiss_selectors=("#disclaimer-over18btn", "#disclaimer-accept_cookies"),
+        random_selector="div[id^=video_]",
+        skip_ad_selector="#skip",
+        video_selector="#player",
+    )
+    cfg = RunConfig(
+        targets=(target,), output_dir=tmp_path,
+        capture=CaptureConfig(mode="frames", duration_s=1.0),
+        nav_timeout_s=15.0, play_confirm_timeout_s=8.0, retries=0, concurrency=1,
+        ad_timeout_s=8.0, random_seed=1,
+    )
+    run = asyncio.run(Orchestrator(cfg).run())
+    r = run.results[0]
+    assert r.passed is True, r.reasons
+    assert r.selected_video.startswith("div[id^=video_]")
+    assert r.ad_skipped is True
+
+
+def test_play_then_ad_then_skip(server, tmp_path):
+    """The ad only appears after clicking play; VPV must play, then skip, then
+    capture the real content."""
+    run = _run(
+        server, "play_then_ad.html", tmp_path,
+        random_selector="div[id^=video_]",
+        play_selector="#play",
+        skip_ad_selector="#skip",
+        video_selector="#player",
+    )
+    r = run.results[0]
+    assert r.passed is True, r.reasons
+    assert r.ad_skipped is True
+
+
+def test_skip_ad_via_text_selector(server, tmp_path):
+    """The 'text=Skip ad' Playwright selector also finds the skip control."""
+    run = _run(
+        server, "age_gated_site.html", tmp_path,
+        dismiss_selectors=("#disclaimer-over18btn", "#disclaimer-accept_cookies"),
+        random_selector="div[id^=video_]",
+        skip_ad_selector="text=Skip ad",
+        video_selector="#player",
+    )
+    r = run.results[0]
+    assert r.passed is True, r.reasons
+    assert r.ad_skipped is True
 
 
 def test_clip_mode_produces_real_video(server, tmp_path):

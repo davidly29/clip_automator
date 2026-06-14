@@ -1,0 +1,55 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VPV fixture: play must be clicked to start the ad</title>
+<!--
+  Models a site where clicking a video opens a player, but the pre-roll ad only
+  starts after the PLAY button is pressed. The "Skip ad" control then appears
+  after a short delay. Verifies VPV clicks play *before* trying to skip.
+-->
+<style> #stage { display: none; } #ad, #skip { display: none; } #skip { cursor: pointer; } </style>
+
+<div id="grid">
+  <div id="video_1" class="mb hdy">Clip 1</div>
+  <div id="video_2" class="mb hdy">Clip 2</div>
+</div>
+
+<div id="stage">
+  <button id="play">Play</button>
+  <div id="ad">Ad… <span id="skip">Skip ad</span></div>
+  <video id="player" muted playsinline width="320" height="180"></video>
+</div>
+
+<canvas id="cv" width="320" height="180" style="display:none"></canvas>
+<script>
+  const $ = (id) => document.getElementById(id);
+  let adShown = false;
+
+  for (const id of ['video_1', 'video_2']) {
+    $(id).addEventListener('click', () => { $('stage').style.display = 'block'; });
+  }
+
+  // Play starts the AD (not the content). Skip appears after the delay.
+  $('play').addEventListener('click', () => {
+    if (adShown) return;
+    adShown = true;
+    $('ad').style.display = 'block';
+    setTimeout(() => { $('skip').style.display = 'inline'; }, 800);
+  });
+
+  $('skip').addEventListener('click', () => {
+    $('ad').style.display = 'none';
+    const cv = $('cv'), ctx = cv.getContext('2d');
+    let t = 0;
+    (function draw() {
+      t += 1;
+      ctx.fillStyle = '#101820';
+      ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.fillStyle = `hsl(${t % 360}, 90%, 55%)`;
+      ctx.fillRect((t * 4) % cv.width, 60, 60, 60);
+      requestAnimationFrame(draw);
+    })();
+    const p = $('player');
+    p.srcObject = cv.captureStream(30);
+    p.play().catch(() => {});
+  });
+</script>

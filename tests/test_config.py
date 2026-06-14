@@ -142,10 +142,35 @@ def test_dismiss_id_and_random_ids_cli(tmp_path):
         "--random-id", "v1", "--random-id", "v2", "--random-seed", "42",
     ])
     t = cfg.targets[0]
-    assert t.dismiss_selector == "#accept"
+    assert t.dismiss_selectors == ("#accept",)
     assert t.random_ids == ("v1", "v2")
     assert cfg.random_seed == 42
     assert cfg.auto_dismiss_consent is True  # default on
+
+
+def test_multiple_dismiss_targets_cli(tmp_path):
+    cfg, _ = load_config([
+        "--url", "https://a.test", "--output-dir", str(tmp_path),
+        "--dismiss-id", "disclaimer-over18btn",
+        "--dismiss-id", "disclaimer-accept_cookies",
+        "--dismiss-selector", ".extra-modal button",
+    ])
+    # CSS selectors come first (in order), then ids (turned into #id).
+    assert cfg.targets[0].dismiss_selectors == (
+        ".extra-modal button", "#disclaimer-over18btn", "#disclaimer-accept_cookies")
+
+
+def test_random_selector_skip_ad_and_ad_timeout_cli(tmp_path):
+    cfg, _ = load_config([
+        "--url", "https://a.test", "--output-dir", str(tmp_path),
+        "--random-selector", "div[id^=video_]",
+        "--skip-ad-selector", "text=Skip ad",
+        "--ad-timeout", "20",
+    ])
+    t = cfg.targets[0]
+    assert t.random_selector == "div[id^=video_]"
+    assert t.skip_ad_selector == "text=Skip ad"
+    assert cfg.ad_timeout_s == 20.0
 
 
 def test_no_auto_dismiss_flag(tmp_path):
@@ -213,7 +238,7 @@ def test_random_ids_from_file(tmp_path):
     }))
     cfg, _ = load_config(["--config", str(cfg_file)])
     assert cfg.auto_dismiss_consent is False
-    assert cfg.targets[0].dismiss_selector == "#ok"
+    assert cfg.targets[0].dismiss_selectors == ("#ok",)
     assert cfg.targets[0].random_ids == ("a", "b", "c")
 
 
@@ -233,6 +258,106 @@ def test_default_frame_count_is_two(tmp_path):
     # Defaults to exactly 2 screenshots regardless of duration/interval.
     assert cfg.capture.frame_count == 2
     assert cfg.capture.planned_frame_count() == 2
+
+
+def test_browser_args_cli(tmp_path):
+    cfg, _ = load_config(["--url", "https://a.test", "--output-dir", str(tmp_path),
+                          "--browser-arg=--disable-gpu",
+                          "--browser-arg=--use-gl=swiftshader"])
+    assert cfg.browser_args == ("--disable-gpu", "--use-gl=swiftshader")
+
+
+def test_browser_args_default_empty(tmp_path):
+    cfg, _ = load_config(["--url", "https://a.test", "--output-dir", str(tmp_path)])
+    assert cfg.browser_args == ()
+
+
+def test_viewport_default_1080p(tmp_path):
+    cfg, _ = load_config(["--url", "https://a.test", "--output-dir", str(tmp_path)])
+    assert (cfg.viewport_width, cfg.viewport_height) == (1920, 1080)
+
+
+def test_viewport_override(tmp_path):
+    cfg, _ = load_config(["--url", "https://a.test", "--output-dir", str(tmp_path),
+                          "--viewport", "1280x720"])
+    assert (cfg.viewport_width, cfg.viewport_height) == (1280, 720)
+
+
+def test_viewport_invalid(tmp_path):
+    with pytest.raises(ConfigError, match="viewport must be"):
+        load_config(["--url", "https://a.test", "--output-dir", str(tmp_path),
+                     "--viewport", "huge"])
+
+
+def _write_profile(tmp_path, name, body):
+    pdir = tmp_path / "profiles"
+    pdir.mkdir(exist_ok=True)
+    (pdir / name).write_text(body, encoding="utf-8")
+    return pdir
+
+
+def test_profile_properties_full(tmp_path, monkeypatch):
+    body = f"""
+# my site
+url = https://yoursite.example/
+dismiss_id = disclaimer-over18btn, disclaimer-accept_cookies
+random_selector = div[id^=video_]
+skip_ad_selector = text=Skip ad
+ad_timeout_s = 20
+video_selector = video
+play_id = anc-tst-play-btn
+fullscreen_selector = span.fullscreen
+mode = clip
+headless = false
+duration_s = 3.5
+output_dir = {tmp_path.as_posix()}
+browser_args = --disable-gpu, --use-gl=swiftshader
+"""
+    _write_profile(tmp_path, "mysite.properties", body)
+    monkeypatch.chdir(tmp_path)
+    cfg, _ = load_config(["--profile", "mysite"])
+
+    t = cfg.targets[0]
+    assert t.url == "https://yoursite.example/"
+    assert t.dismiss_selectors == ("#disclaimer-over18btn", "#disclaimer-accept_cookies")
+    assert t.random_selector == "div[id^=video_]"
+    assert t.skip_ad_selector == "text=Skip ad"        # value keeps its '='
+    assert t.play_selector == "#anc-tst-play-btn"
+    assert t.fullscreen_selector == "span.fullscreen"
+    assert cfg.ad_timeout_s == 20.0
+    assert cfg.capture.mode == "clip"
+    assert cfg.capture.duration_s == 3.5
+    assert cfg.headless is False
+    assert cfg.browser_args == ("--disable-gpu", "--use-gl=swiftshader")
+
+
+def test_profile_cli_override(tmp_path, monkeypatch):
+    _write_profile(tmp_path, "s.properties",
+                   f"url = https://a.test/\nmode = frames\noutput_dir = {tmp_path.as_posix()}\n")
+    monkeypatch.chdir(tmp_path)
+    cfg, _ = load_config(["--profile", "s", "--mode", "clip"])
+    assert cfg.capture.mode == "clip"  # CLI wins over the profile
+
+
+def test_profile_not_found(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ConfigError, match="profile 'nope' not found"):
+        load_config(["--profile", "nope"])
+
+
+def test_profile_bad_bool(tmp_path, monkeypatch):
+    _write_profile(tmp_path, "b.properties",
+                   f"url = https://a.test/\nheadless = maybe\noutput_dir = {tmp_path.as_posix()}\n")
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ConfigError, match="headless.*true/false"):
+        load_config(["--profile", "b"])
+
+
+def test_config_accepts_properties_extension(tmp_path):
+    f = tmp_path / "site.properties"
+    f.write_text(f"url = https://a.test/\noutput_dir = {tmp_path.as_posix()}\n", encoding="utf-8")
+    cfg, _ = load_config(["--config", str(f)])
+    assert cfg.targets[0].url == "https://a.test/"
 
 
 def test_warmup_default_and_override(tmp_path):

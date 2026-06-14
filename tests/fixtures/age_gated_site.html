@@ -1,0 +1,82 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VPV fixture: age gate + cookies + video grid + pre-roll ad</title>
+<!--
+  Replicates a real adult-content video site:
+    - an overlay with TWO <span> "buttons" (not real buttons): an age gate
+      (#disclaimer-over18btn) and a cookie accept (#disclaimer-accept_cookies);
+    - a grid of videos as <div id="video_NNN">;
+    - clicking a video shows a 1s pre-roll ad with a "Skip ad" control that
+      becomes clickable after the delay; skipping starts the real (playing) video.
+  (Ad delay is 1s here, not 5s, to keep the test fast.)
+-->
+<style>
+  #overlay { position: fixed; inset: 0; background: rgba(0,0,0,.8); z-index: 10; }
+  #overlay span { display: inline-block; margin: 20px; padding: 10px; cursor: pointer; color:#fff; }
+  #stage, #ad { display: none; }
+  #ad { background:#000; color:#fff; padding:8px; }
+  #skip { display: none; cursor: pointer; color:#9cf; }
+</style>
+
+<div id="overlay">
+  <span class="text-top" id="disclaimer-over18btn">I am 18 years old or older</span>
+  <span class="text-top" id="disclaimer-accept_cookies">Accept all cookies</span>
+</div>
+
+<h1>Tube</h1>
+<div id="grid">
+  <div id="video_101" class="mb hdy">Clip 101</div>
+  <div id="video_102" class="mb hdy">Clip 102</div>
+  <div id="video_103" class="mb hdy">Clip 103</div>
+</div>
+
+<div id="stage">
+  <div id="ad">Ad playing… <span id="skip">Skip ad</span></div>
+  <video id="player" muted playsinline width="320" height="180"></video>
+</div>
+
+<canvas id="cv" width="320" height="180" style="display:none"></canvas>
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  let dismissed = 0;
+  function gate(spanId) {
+    $(spanId).addEventListener('click', () => {
+      $(spanId).style.display = 'none';
+      if (++dismissed >= 2) $('overlay').remove();  // both accepted -> unblock
+    });
+  }
+  gate('disclaimer-over18btn');
+  gate('disclaimer-accept_cookies');
+
+  function startContent() {
+    const cv = $('cv'), ctx = cv.getContext('2d');
+    let t = 0;
+    (function draw() {
+      t += 1;
+      ctx.fillStyle = '#101820';
+      ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.fillStyle = `hsl(${t % 360}, 90%, 55%)`;
+      ctx.fillRect((t * 4) % cv.width, 60, 60, 60);
+      requestAnimationFrame(draw);
+    })();
+    const p = $('player');
+    p.srcObject = cv.captureStream(30);
+    p.play().catch(() => {});
+  }
+
+  function openVideo() {
+    $('stage').style.display = 'block';
+    $('ad').style.display = 'block';
+    // Skip becomes available only after the (shortened) pre-roll delay.
+    setTimeout(() => { $('skip').style.display = 'inline'; }, 1000);
+  }
+  $('skip').addEventListener('click', () => {
+    $('ad').style.display = 'none';
+    startContent();
+  });
+
+  for (const id of ['video_101', 'video_102', 'video_103']) {
+    $(id).addEventListener('click', openVideo);
+  }
+</script>

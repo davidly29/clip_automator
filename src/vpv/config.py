@@ -24,14 +24,16 @@ _TARGET_KEYS = {
     "url", "video_selector", "video_index",
     "dismiss_selector", "dismiss_id",
     "search_selector", "search_id", "search_query", "search_submit",
-    "result_selector", "random_ids",
-    "play_selector", "fullscreen_selector", "fullscreen_target", "fullscreen_id",
+    "result_selector", "random_ids", "random_selector", "skip_ad_selector",
+    "play_selector", "play_id",
+    "fullscreen_selector", "fullscreen_target", "fullscreen_id",
 }
 _TOP_KEYS = {
     "output_dir", "concurrency", "headless", "nav_timeout_s",
     "play_confirm_timeout_s", "retries", "log_level", "user_agent",
-    "browser", "auto_dismiss_consent", "consent_texts", "fullscreen", "random_seed",
-    "capture", "verification", "targets",
+    "browser", "browser_args", "viewport",
+    "auto_dismiss_consent", "consent_texts", "fullscreen", "ad_timeout_s",
+    "random_seed", "capture", "verification", "targets",
 }
 
 DEFAULT_OUTPUT_DIR = Path.home() / "vpv-artifacts"
@@ -97,15 +99,18 @@ class TargetConfig:
     url: str
     video_selector: str = "video"
     video_index: int = 0
-    # --- entry overlays (consent / first-visit modal) ---
-    dismiss_selector: str | None = None     # explicit OK/Accept button to click
+    # --- entry overlays (consent / age gate / cookie modal) ---
+    dismiss_selectors: tuple[str, ...] = ()  # one or more OK/Accept elements to click
     # --- interaction flow (all optional) ---
     search_selector: str | None = None      # search bar, e.g. "#search" or "input[name=q]"
     search_query: str | None = None         # text typed into the search bar
     search_submit: str | None = None        # submit button; None => press Enter
     result_selector: str | None = None       # search result to click to open the video
     # --- random pick from the homepage ---
-    random_ids: tuple[str, ...] = ()        # candidate video element ids/selectors
+    random_ids: tuple[str, ...] = ()        # candidate video element ids
+    random_selector: str | None = None       # OR a CSS selector; one match picked at random
+    # --- pre-roll ad ---
+    skip_ad_selector: str | None = None      # element to click to skip a pre-roll ad
     # --- player controls ---
     play_selector: str | None = None        # play button to click
     fullscreen_selector: str | None = None  # fullscreen button to click
@@ -117,12 +122,14 @@ class TargetConfig:
             "url": self.url,
             "video_selector": self.video_selector,
             "video_index": self.video_index,
-            "dismiss_selector": self.dismiss_selector,
+            "dismiss_selectors": list(self.dismiss_selectors),
             "search_selector": self.search_selector,
             "search_query": self.search_query,
             "search_submit": self.search_submit,
             "result_selector": self.result_selector,
             "random_ids": list(self.random_ids),
+            "random_selector": self.random_selector,
+            "skip_ad_selector": self.skip_ad_selector,
             "play_selector": self.play_selector,
             "fullscreen_selector": self.fullscreen_selector,
             "fullscreen_target": self.fullscreen_target,
@@ -141,11 +148,15 @@ class RunConfig:
     concurrency: int = 2
     headless: bool = True
     browser: Literal["chromium", "firefox", "webkit"] = "chromium"
+    browser_args: tuple[str, ...] = ()      # extra flags passed to the browser launch
+    viewport_width: int = 1920              # browser viewport + clip recording size
+    viewport_height: int = 1080
     user_agent: str | None = None
     log_level: str = "INFO"
     auto_dismiss_consent: bool = True       # auto-click common consent/OK buttons
     consent_texts: tuple[str, ...] = ()     # override accept-button phrases (() = built-in)
     fullscreen: bool = True                 # put the video fullscreen before capture
+    ad_timeout_s: float = 15.0              # how long to wait for a skip-ad control
     random_seed: int | None = None          # seed for random video selection
 
     def to_dict(self) -> dict:
@@ -154,6 +165,8 @@ class RunConfig:
             "concurrency": self.concurrency,
             "headless": self.headless,
             "browser": self.browser,
+            "browser_args": list(self.browser_args),
+            "viewport": f"{self.viewport_width}x{self.viewport_height}",
             "nav_timeout_s": self.nav_timeout_s,
             "play_confirm_timeout_s": self.play_confirm_timeout_s,
             "retries": self.retries,
@@ -162,6 +175,7 @@ class RunConfig:
             "auto_dismiss_consent": self.auto_dismiss_consent,
             "consent_texts": list(self.consent_texts),
             "fullscreen": self.fullscreen,
+            "ad_timeout_s": self.ad_timeout_s,
             "random_seed": self.random_seed,
             "capture": self.capture.to_dict(),
             "verification": self.verification.to_dict(),
@@ -199,23 +213,184 @@ def _coerce_str_list(raw, where: str, key: str) -> tuple[str, ...]:
     return tuple(x.strip() for x in raw if x.strip())
 
 
+def _as_list(v) -> list[str]:
+    """Accept None, a single string, or a list of strings -> list of strings."""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, list) and all(isinstance(x, str) for x in v):
+        return list(v)
+    raise ConfigError("expected a string or list of strings")
+
+
+def _resolve_dismiss(selectors, ids) -> tuple[str, ...]:
+    """Build the ordered list of overlay-dismiss selectors from CSS selectors
+    and/or bare HTML ids (each turned into #id)."""
+    out: list[str] = []
+    for s in _as_list(selectors):
+        s = s.strip()
+        if s:
+            out.append(s)
+    for i in _as_list(ids):
+        i = i.strip().lstrip("#")
+        if i:
+            out.append(f"#{i}")
+    return tuple(out)
+
+
+def _parse_viewport(value: str) -> tuple[int, int]:
+    m = re.match(r"^\s*(\d+)\s*[xX]\s*(\d+)\s*$", value)
+    if not m:
+        raise ConfigError(f"viewport must be WIDTHxHEIGHT (e.g. 1920x1080), got {value!r}")
+    w, h = int(m.group(1)), int(m.group(2))
+    if w <= 0 or h <= 0:
+        raise ConfigError("viewport width and height must be > 0")
+    return w, h
+
+
 def _reject_unknown(d: dict, allowed: set[str], where: str) -> None:
     extra = set(d) - allowed
     if extra:
         raise ConfigError(f"Unknown {where} key(s): {', '.join(sorted(extra))}")
 
 
+# --- .properties profile support -------------------------------------------
+# Flat key=value files (one per website) that map onto the config schema.
+_PROP_BOOL = {"headless", "auto_dismiss_consent", "fullscreen"}
+_PROP_INT = {"concurrency", "retries", "video_index", "frame_count", "width",
+             "height", "interval_ms", "random_seed"}
+_PROP_FLOAT = {"nav_timeout_s", "play_confirm_timeout_s", "duration_s", "warmup_s",
+               "ad_timeout_s", "min_time_advance_s", "frozen_frame_threshold",
+               "blank_frame_max_variance"}
+_PROP_LIST = {"consent_texts", "browser_args", "random_ids",
+              "dismiss_selector", "dismiss_id"}
+_PROP_CAPTURE = {"mode", "duration_s", "interval_ms", "frame_count", "width",
+                 "height", "warmup_s"}
+_PROP_VERIFY = {"min_time_advance_s", "frozen_frame_threshold", "blank_frame_max_variance"}
+_PROP_TARGET = {
+    "url", "video_selector", "video_index", "dismiss_selector", "dismiss_id",
+    "search_selector", "search_id", "search_query", "search_submit",
+    "result_selector", "random_ids", "random_selector", "skip_ad_selector",
+    "play_selector", "play_id", "fullscreen_selector", "fullscreen_target",
+    "fullscreen_id",
+}
+
+
+def _coerce_prop(key: str, value: str):
+    """Coerce a raw string properties value to the type the schema expects."""
+    v = value.strip()
+    if key in _PROP_BOOL:
+        low = v.lower()
+        if low in ("true", "1", "yes", "on"):
+            return True
+        if low in ("false", "0", "no", "off"):
+            return False
+        raise ConfigError(f"property {key!r} must be true/false, got {value!r}")
+    if key in _PROP_INT:
+        try:
+            return int(v)
+        except ValueError as e:
+            raise ConfigError(f"property {key!r} must be an integer, got {value!r}") from e
+    if key in _PROP_FLOAT:
+        try:
+            return float(v)
+        except ValueError as e:
+            raise ConfigError(f"property {key!r} must be a number, got {value!r}") from e
+    if key in _PROP_LIST:
+        return [x.strip() for x in v.split(",") if x.strip()]
+    return v
+
+
+def _parse_properties(text: str) -> dict:
+    """Parse a flat key=value (or key:value) properties file into a config dict.
+
+    Lines starting with # or ! are comments. Keys mirror the CLI/config names;
+    capture/verification/target keys are routed into their sub-objects so the
+    rest of the loader treats a profile exactly like a JSON config.
+    """
+    flat: dict = {}
+    for n, line in enumerate(text.splitlines(), start=1):
+        s = line.strip()
+        if not s or s[0] in "#!":
+            continue
+        # Split on the FIRST '=' or ':' only, so values may contain either
+        # (e.g. "skip_ad_selector = text=Skip ad" or a URL with "://").
+        positions = [i for i in (s.find("="), s.find(":")) if i != -1]
+        if not positions:
+            raise ConfigError(f"profile line {n}: expected 'key = value', got {line!r}")
+        idx = min(positions)
+        k, val = s[:idx], s[idx + 1:]
+        if not k.strip():
+            raise ConfigError(f"profile line {n}: missing key, got {line!r}")
+        flat[k.strip()] = val
+
+    cfg: dict = {}
+    capture: dict = {}
+    verification: dict = {}
+    target: dict = {}
+    for k, raw in flat.items():
+        coerced = _coerce_prop(k, raw)
+        if k in _PROP_CAPTURE:
+            capture[k] = coerced
+        elif k in _PROP_VERIFY:
+            verification[k] = coerced
+        elif k in _PROP_TARGET:
+            target[k] = coerced
+        else:
+            cfg[k] = coerced   # top-level run key (validated later)
+    if capture:
+        cfg["capture"] = capture
+    if verification:
+        cfg["verification"] = verification
+    if target:
+        cfg["targets"] = [target]
+    return cfg
+
+
+def _profile_search_dirs(profiles_dir: str | None) -> list[Path]:
+    dirs: list[Path] = []
+    if profiles_dir:
+        dirs.append(Path(profiles_dir))
+    env = os.environ.get("VPV_PROFILES_DIR")
+    if env:
+        dirs.append(Path(env))
+    dirs.append(Path.cwd() / "profiles")
+    dirs.append(Path.home() / ".vpv" / "profiles")
+    return dirs
+
+
+def _resolve_profile(name: str, profiles_dir: str | None) -> Path:
+    """Find a profile file by name across the profile search directories."""
+    direct = Path(name)
+    if direct.is_file():
+        return direct
+    exts = ["", ".properties", ".jsonc", ".json"]
+    searched: list[str] = []
+    for d in _profile_search_dirs(profiles_dir):
+        for ext in exts:
+            cand = d / f"{name}{ext}"
+            searched.append(str(cand))
+            if cand.is_file():
+                return cand
+    raise ConfigError(
+        f"profile {name!r} not found. Looked in:\n  " + "\n  ".join(searched))
+
+
 def _load_file(path: Path) -> dict:
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError as e:
-        raise ConfigError(f"Cannot read config file {path}: {e}") from e
-    try:
-        data = json.loads(_strip_jsonc(raw))
-    except json.JSONDecodeError as e:
-        raise ConfigError(f"Invalid JSON in {path}: {e}") from e
+        raise ConfigError(f"Cannot read config/profile file {path}: {e}") from e
+    if path.suffix.lower() == ".properties":
+        data = _parse_properties(raw)
+    else:
+        try:
+            data = json.loads(_strip_jsonc(raw))
+        except json.JSONDecodeError as e:
+            raise ConfigError(f"Invalid JSON in {path}: {e}") from e
     if not isinstance(data, dict):
-        raise ConfigError("Config file must contain a JSON object at the top level")
+        raise ConfigError("Config file must contain an object at the top level")
     _reject_unknown(data, _TOP_KEYS, "config")
     return data
 
@@ -226,13 +401,19 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Verify that videos on a web page actually play and capture "
                     "a proof-of-playback snippet.",
     )
-    p.add_argument("--config", type=Path, help="Path to a JSON/JSONC config file.")
+    src = p.add_mutually_exclusive_group()
+    src.add_argument("--config", type=Path, help="Path to a JSON/JSONC/.properties config file.")
+    src.add_argument("--profile", help="Named profile to load (e.g. 'mysite'); resolved from "
+                                       "./profiles, $VPV_PROFILES_DIR, or ~/.vpv/profiles.")
+    p.add_argument("--profiles-dir", help="Extra directory to search for --profile files.")
     p.add_argument("--url", help="Target page URL (single-target shorthand).")
     p.add_argument("--video-selector", help="CSS selector for the video element.")
     p.add_argument("--video-index", type=int, help="Which match if selector returns many.")
-    # --- entry overlays (consent / first-visit modal) ---
-    p.add_argument("--dismiss-selector", help="CSS selector for an OK/Accept button to click.")
-    p.add_argument("--dismiss-id", help="HTML id of an OK/Accept button (shorthand for #id).")
+    # --- entry overlays (consent / age gate / cookie modal) ---
+    p.add_argument("--dismiss-selector", dest="dismiss_selectors", action="append",
+                   help="CSS selector of an overlay element to click (repeatable).")
+    p.add_argument("--dismiss-id", dest="dismiss_ids", action="append",
+                   help="HTML id of an overlay element to click (repeatable; => #id).")
     auto = p.add_mutually_exclusive_group()
     auto.add_argument("--auto-dismiss", dest="auto_dismiss_consent",
                       action="store_true", default=None,
@@ -248,7 +429,16 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- random pick from the homepage ---
     p.add_argument("--random-id", dest="random_ids", action="append",
                    help="Candidate video id to pick from at random (repeatable).")
+    p.add_argument("--random-selector",
+                   help="CSS selector; one matching element is picked at random and clicked "
+                        "(e.g. 'div[id^=video_]').")
     p.add_argument("--random-seed", type=int, help="Seed for reproducible random selection.")
+    # --- pre-roll ad ---
+    p.add_argument("--skip-ad-selector",
+                   help="Element to click to skip a pre-roll ad (e.g. 'text=Skip ad'); "
+                        "VPV waits for it to become clickable.")
+    p.add_argument("--ad-timeout", dest="ad_timeout_s", type=float,
+                   help="Max seconds to wait for the skip-ad control to appear (default 15).")
     # --- interaction flow (single-target shorthand) ---
     p.add_argument("--search-selector", help="CSS selector for the search bar.")
     p.add_argument("--search-id", help="HTML id of the search bar (shorthand for #id).")
@@ -258,6 +448,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--result-selector", help="CSS selector for the search result to click "
                                              "to open the video.")
     p.add_argument("--play-selector", help="CSS selector for the play button.")
+    p.add_argument("--play-id", help="HTML id of the play button (shorthand for #id).")
     p.add_argument("--fullscreen-selector", help="CSS selector for a fullscreen button to click.")
     p.add_argument("--fullscreen-target",
                    help="CSS selector of the element to make fullscreen "
@@ -280,6 +471,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--retries", type=int, help="Retries per target on transient failure.")
     p.add_argument("--concurrency", type=int, help="Max targets checked in parallel.")
     p.add_argument("--browser", choices=["chromium", "firefox", "webkit"], help="Browser engine.")
+    p.add_argument("--browser-arg", dest="browser_args", action="append",
+                   help="Extra flag passed to the browser launch, e.g. "
+                        "--browser-arg=--disable-gpu (repeatable; use the = form).")
+    p.add_argument("--viewport", help="Viewport + clip recording size, e.g. 1920x1080 "
+                                      "(default). The clip is recorded at this size.")
     p.add_argument("--user-agent", help="Custom, identifiable User-Agent string.")
     p.add_argument("--log-level", help="DEBUG/INFO/WARNING/ERROR.")
     p.add_argument("--result-file", type=Path, help="Also write the JSON result to this path.")
@@ -303,7 +499,7 @@ def _coerce_targets(raw: Any) -> list[TargetConfig]:
             url=t["url"].strip(),
             video_selector=t.get("video_selector", "video"),
             video_index=int(t.get("video_index", 0)),
-            dismiss_selector=_resolve_selector(
+            dismiss_selectors=_resolve_dismiss(
                 t.get("dismiss_selector"), t.get("dismiss_id")),
             search_selector=_resolve_selector(
                 t.get("search_selector"), t.get("search_id")),
@@ -311,7 +507,9 @@ def _coerce_targets(raw: Any) -> list[TargetConfig]:
             search_submit=t.get("search_submit"),
             result_selector=t.get("result_selector"),
             random_ids=_coerce_str_list(t.get("random_ids"), f"targets[{i}]", ".random_ids"),
-            play_selector=t.get("play_selector"),
+            random_selector=t.get("random_selector"),
+            skip_ad_selector=t.get("skip_ad_selector"),
+            play_selector=_resolve_selector(t.get("play_selector"), t.get("play_id")),
             fullscreen_selector=t.get("fullscreen_selector"),
             fullscreen_target=_resolve_selector(
                 t.get("fullscreen_target"), t.get("fullscreen_id")),
@@ -328,7 +526,9 @@ def load_config(argv: list[str]) -> tuple[RunConfig, Path | None]:
     args = _build_parser().parse_args(argv)
 
     file_data: dict = {}
-    if args.config:
+    if args.profile:
+        file_data = _load_file(_resolve_profile(args.profile, args.profiles_dir))
+    elif args.config:
         file_data = _load_file(args.config)
 
     # --- capture: file then CLI overrides ---
@@ -371,13 +571,15 @@ def load_config(argv: list[str]) -> tuple[RunConfig, Path | None]:
             url=args.url.strip(),
             video_selector=args.video_selector or "video",
             video_index=args.video_index or 0,
-            dismiss_selector=_resolve_selector(args.dismiss_selector, args.dismiss_id),
+            dismiss_selectors=_resolve_dismiss(args.dismiss_selectors, args.dismiss_ids),
             search_selector=_resolve_selector(args.search_selector, args.search_id),
             search_query=args.search_query,
             search_submit=args.search_submit,
             result_selector=args.result_selector,
             random_ids=tuple(args.random_ids or ()),
-            play_selector=args.play_selector,
+            random_selector=args.random_selector,
+            skip_ad_selector=args.skip_ad_selector,
+            play_selector=_resolve_selector(args.play_selector, args.play_id),
             fullscreen_selector=args.fullscreen_selector,
             fullscreen_target=_resolve_selector(args.fullscreen_target, args.fullscreen_id),
         )]
@@ -394,6 +596,9 @@ def load_config(argv: list[str]) -> tuple[RunConfig, Path | None]:
 
     user_agent = args.user_agent or file_data.get("user_agent") or os.environ.get("VPV_USER_AGENT")
 
+    viewport_raw = args.viewport or file_data.get("viewport")
+    viewport_w, viewport_h = _parse_viewport(viewport_raw) if viewport_raw else (1920, 1080)
+
     cfg = RunConfig(
         targets=tuple(targets),
         output_dir=output_dir,
@@ -406,6 +611,11 @@ def load_config(argv: list[str]) -> tuple[RunConfig, Path | None]:
         concurrency=_pick(args.concurrency, file_data.get("concurrency"), 2),
         headless=_pick(args.headless, file_data.get("headless"), True),
         browser=args.browser or file_data.get("browser", "chromium"),
+        browser_args=(tuple(args.browser_args) if args.browser_args
+                      else _coerce_str_list(file_data.get("browser_args"),
+                                            "", "browser_args")),
+        viewport_width=viewport_w,
+        viewport_height=viewport_h,
         user_agent=user_agent,
         log_level=(args.log_level or file_data.get("log_level", "INFO")).upper(),
         auto_dismiss_consent=_pick(args.auto_dismiss_consent,
@@ -414,6 +624,7 @@ def load_config(argv: list[str]) -> tuple[RunConfig, Path | None]:
                        else _coerce_str_list(file_data.get("consent_texts"),
                                              "", "consent_texts")),
         fullscreen=_pick(args.fullscreen, file_data.get("fullscreen"), True),
+        ad_timeout_s=_pick(args.ad_timeout_s, file_data.get("ad_timeout_s"), 15.0),
         random_seed=_pick(args.random_seed, file_data.get("random_seed"), None),
     )
     _validate(cfg)

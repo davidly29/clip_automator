@@ -42,10 +42,6 @@ def ffmpeg_exe() -> str | None:
     return shutil.which("ffmpeg")
 
 
-def ffmpeg_available() -> bool:
-    return ffmpeg_exe() is not None
-
-
 def _maybe_downscale(png: bytes, width: int | None, height: int | None) -> bytes:
     if width is None and height is None:
         return png
@@ -137,38 +133,3 @@ class CaptureEngine:
         self._log.info("clip trimmed to fullscreen window (offset=%.2fs, dur=%s)",
                        start_offset_s, f"{clip_duration_s:.2f}s" if clip_duration_s else "full")
         return out_path
-
-    def encode_clip(self, frames: list[Frame], out_dir: Path) -> Path | None:
-        """Fallback: assemble sampled frames into snippet.mp4 via ffmpeg.
-
-        Used only when no Playwright recording is available (e.g. recording was
-        disabled). Returns the clip path or None.
-        """
-        if not frames:
-            return None
-        exe = ffmpeg_exe()
-        if not exe:
-            self._log.warning("ffmpeg not found; skipping clip encode (frames kept)")
-            return None
-
-        tmp = out_dir / "_clip_src"
-        tmp.mkdir(parents=True, exist_ok=True)
-        try:
-            for f in frames:
-                (tmp / f"f_{f.index:04d}.png").write_bytes(f.png)
-            fps = max(1, round(1000.0 / max(1, self._cfg.interval_ms)))
-            out_path = out_dir / "snippet.mp4"
-            cmd = [
-                exe, "-y", "-framerate", str(fps),
-                "-i", str(tmp / "f_%04d.png"),
-                "-pix_fmt", "yuv420p",
-                "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-                str(out_path),
-            ]
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode != 0:
-                self._log.warning("ffmpeg failed: %s", proc.stderr.strip()[:400])
-                return None
-            return out_path
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)

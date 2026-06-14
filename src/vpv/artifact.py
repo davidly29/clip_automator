@@ -63,6 +63,7 @@ class ArtifactWriter:
         recorded_video=None,
         selected_video: str | None = None,
         fullscreen: bool | None = None,
+        ad_skipped: bool | None = None,
         clip_start_offset: float = 0.0,
         clip_duration: float | None = None,
     ) -> ArtifactRef:
@@ -78,22 +79,25 @@ class ArtifactWriter:
             files.append(name)
 
         if self._cfg.capture.mode == "clip":
-            # Prefer the real Playwright recording; fall back to assembling the
-            # sampled frames if no recording was captured.
             if recorded_video is not None:
                 clip = capture_engine.finalize_clip(
                     recorded_video, out_dir,
                     start_offset_s=clip_start_offset, clip_duration_s=clip_duration)
+                if clip is not None:
+                    files.append(clip.name)
             else:
-                clip = capture_engine.encode_clip(frames, out_dir)
-            if clip is not None:
-                files.append(clip.name)
+                self._log.warning("clip mode but no recording was captured; "
+                                  "only frames saved")
 
         metadata = {
             "captured_at": when.isoformat(),
             "target": target.to_dict(),
             "selected_video": selected_video,
             "fullscreen": fullscreen,
+            "ad_skipped": ad_skipped,
+            # Captured media is video-only — Playwright recording and frame
+            # screenshots never include audio (also why playback is muted).
+            "audio_captured": False,
             "verdict": verdict.to_dict(),
             "before": before.to_dict() if before else None,
             "after": after.to_dict() if after else None,

@@ -41,7 +41,7 @@ el => ({
   error_code: (el.error ? el.error.code : null),
   video_width: el.videoWidth,
   video_height: el.videoHeight,
-  has_media_keys: !!el.mediaKeys,
+  has_media_keys: !!(el.mediaKeys || window.__vpvEncrypted),
   tag: el.tagName
 })
 """
@@ -148,7 +148,11 @@ class BrowserController:
         try:
             self._pw = await async_playwright().start()
             launcher = getattr(self._pw, self._cfg.browser)
-            self._browser = await launcher.launch(headless=self._cfg.headless)
+            launch_kwargs: dict = {"headless": self._cfg.headless}
+            if self._cfg.browser_args:
+                launch_kwargs["args"] = list(self._cfg.browser_args)
+                self._log.info("browser launch args: %s", " ".join(self._cfg.browser_args))
+            self._browser = await launcher.launch(**launch_kwargs)
         except Exception as e:
             raise BrowserError(f"failed to launch {self._cfg.browser}: {e}") from e
 
@@ -171,60 +175,69 @@ class BrowserController:
         """
         if not self._browser:
             raise BrowserError("browser not open")
-        ctx_kwargs: dict = {}
+        size = {"width": self._cfg.viewport_width, "height": self._cfg.viewport_height}
+        ctx_kwargs: dict = {"viewport": dict(size)}
         if self._cfg.user_agent:
             ctx_kwargs["user_agent"] = self._cfg.user_agent
         if record_video_dir:
             ctx_kwargs["record_video_dir"] = record_video_dir
+            # Record the clip at the viewport size (e.g. 1920x1080).
+            ctx_kwargs["record_video_size"] = dict(size)
         context = await self._browser.new_context(**ctx_kwargs)
         page = await context.new_page()
+        # Flag EME/DRM early: a capture-phase listener catches the 'encrypted'
+        # event for any media element (it fires before mediaKeys is observable,
+        # and on sites where el.mediaKeys never becomes set).
+        await page.add_init_script(
+            "document.addEventListener('encrypted',"
+            "()=>{window.__vpvEncrypted=true;},true);")
         return context, page
 
-    async def dismiss_overlays(self, page, target: TargetConfig) -> str | None:
-        """Best-effort dismissal of a consent / first-visit modal.
+    async def dismiss_overlays(self, page, target: TargetConfig) -> list[str]:
+        """Best-effort dismissal of consent / age-gate / cookie overlays.
 
-        Strategy, in order (stops at the first successful click):
-          1. an explicit ``dismiss_selector`` the operator provided;
-          2. (if ``auto_dismiss_consent``) well-known consent-button selectors;
-          3. (if ``auto_dismiss_consent``) any button whose accessible name
-             matches a common accept/OK phrase, searched across all frames.
-        Never raises — a page without a banner is the normal case.
+        Strategy:
+          1. Click every explicit ``dismiss_selectors`` element the operator gave
+             (e.g. an age gate then a cookie banner), in order — these can be any
+             element (a <span>, link, ...), not just buttons.
+          2. Only if none were given and ``auto_dismiss_consent`` is on, fall back
+             to known consent selectors and the accept-button text heuristic.
+        Never raises — a page without an overlay is the normal case.
         """
-        clicked: str | None = None
+        clicked: list[str] = []
 
-        # 1) explicit, operator-provided button.
-        if target.dismiss_selector:
-            if await self._try_click(page.locator(target.dismiss_selector).first):
-                clicked = target.dismiss_selector
+        # 1) explicit, operator-provided elements (age gate, cookies, ...).
+        for sel in target.dismiss_selectors:
+            if await self._click_selector(page, sel, timeout_ms=5000):
+                clicked.append(sel)
+                # Each dismissal may reveal the next overlay or reload the page.
+                await self._settle(page)
+        if clicked:
+            self._log.info("dismissed overlay(s) via %s", ", ".join(clicked))
+            return clicked
 
-        # 2) known consent-framework selectors (OneTrust, Funding Choices, ...).
-        if clicked is None and self._cfg.auto_dismiss_consent:
-            for sel in _CONSENT_SELECTORS:
-                for frame in page.frames:
-                    if await self._try_click(frame.locator(sel).first):
-                        clicked = sel
-                        break
-                if clicked:
-                    break
+        if not self._cfg.auto_dismiss_consent:
+            return []
 
-        # 3) role+text heuristic across all frames.
-        if clicked is None and self._cfg.auto_dismiss_consent:
+        # 2a) known consent-framework selectors (OneTrust, Funding Choices, ...).
+        for sel in _CONSENT_SELECTORS:
             for frame in page.frames:
-                try:
-                    btn = frame.get_by_role("button", name=self._consent_re).first
-                except Exception:  # noqa: BLE001 - detached/cross-origin frame
-                    continue
-                if await self._try_click(btn):
-                    clicked = "role=button[accept]"
-                    break
+                if await self._try_click(frame.locator(sel).first):
+                    self._log.info("auto-dismissed consent via %s", sel)
+                    await self._settle(page)
+                    return [sel]
 
-        if clicked is not None:
-            self._log.info("dismissed overlay via %s", clicked)
-            # Dismissal frequently triggers a navigation/redirect (e.g. a consent
-            # page back to the site). Let it settle so a later step doesn't run
-            # against a destroyed execution context.
-            await self._settle(page)
-        return clicked
+        # 2b) role+text heuristic across all frames.
+        for frame in page.frames:
+            try:
+                btn = frame.get_by_role("button", name=self._consent_re).first
+            except Exception:  # noqa: BLE001 - detached/cross-origin frame
+                continue
+            if await self._try_click(btn):
+                self._log.info("auto-dismissed consent via accept-button text")
+                await self._settle(page)
+                return ["role=button[accept]"]
+        return []
 
     async def _try_click(self, locator, timeout_ms: int = 1200) -> bool:
         from playwright.async_api import Error as PWError
@@ -237,36 +250,90 @@ class BrowserController:
         except (PWTimeout, PWError):
             return False
 
+    async def _click_selector(self, page, selector: str, timeout_ms: int) -> bool:
+        """Wait for a selector to become visible, then click it. Best-effort."""
+        from playwright.async_api import Error as PWError
+        from playwright.async_api import TimeoutError as PWTimeout
+        loc = page.locator(selector).first
+        try:
+            await loc.wait_for(state="visible", timeout=timeout_ms)
+            await loc.click(timeout=timeout_ms)
+            return True
+        except (PWTimeout, PWError):
+            return False
+
     async def pick_random_video(
         self, page, target: TargetConfig, rng: random.Random
     ) -> str | None:
-        """Randomly pick one of the candidate video ids present and click it."""
-        if not target.random_ids:
-            return None
-
-        present: list[str] = []
-        for rid in target.random_ids:
-            sel = rid if rid[:1] in "#.[" else f"#{rid}"
-            try:
-                if await page.locator(sel).count() > 0:
-                    present.append(sel)
-            except Exception:  # noqa: BLE001 - bad selector => skip candidate
-                continue
-        if not present:
-            raise VideoNotFound(
-                f"none of the random video ids were found: {list(target.random_ids)}")
-
-        chosen = rng.choice(present)
-        self._log.info("randomly selected %s (from %d present)", chosen, len(present))
+        """Open a random video. Prefers ``random_selector`` (a CSS selector with
+        many matches), else falls back to ``random_ids`` (explicit ids)."""
         from playwright.async_api import Error as PWError
         from playwright.async_api import TimeoutError as PWTimeout
+
+        chosen: str
+        chosen_loc = None
+
+        if target.random_selector:
+            loc = page.locator(target.random_selector)
+            try:
+                count = await loc.count()
+            except Exception:  # noqa: BLE001 - bad selector
+                count = 0
+            if count == 0:
+                raise VideoNotFound(
+                    f"no elements match random selector {target.random_selector!r}")
+            idx = rng.randrange(count)
+            chosen_loc = loc.nth(idx)
+            chosen = f"{target.random_selector}[{idx}]"
+            self._log.info("randomly selected #%d of %d for %s",
+                           idx, count, target.random_selector)
+        elif target.random_ids:
+            present: list[str] = []
+            for rid in target.random_ids:
+                sel = rid if rid[:1] in "#.[" else f"#{rid}"
+                try:
+                    if await page.locator(sel).count() > 0:
+                        present.append(sel)
+                except Exception:  # noqa: BLE001 - bad selector => skip candidate
+                    continue
+            if not present:
+                raise VideoNotFound(
+                    f"none of the random video ids were found: {list(target.random_ids)}")
+            chosen = rng.choice(present)
+            chosen_loc = page.locator(chosen).first
+            self._log.info("randomly selected %s (from %d present)", chosen, len(present))
+        else:
+            return None
+
         try:
-            await page.locator(chosen).first.click(
-                timeout=self._cfg.play_confirm_timeout_s * 1000)
+            await chosen_loc.click(timeout=self._cfg.play_confirm_timeout_s * 1000)
         except (PWTimeout, PWError) as e:
             raise BrowserError(f"could not open random video {chosen!r}: {e}") from e
         await self._settle(page)
         return chosen
+
+    async def skip_ad(self, page, target: TargetConfig) -> bool:
+        """Skip a pre-roll ad by clicking the skip control once it appears.
+
+        Pre-roll ads typically enforce a few seconds before the skip control
+        becomes clickable; Playwright's wait handles that — we just wait up to
+        ``ad_timeout_s`` for it to be visible, then click. Best-effort.
+        """
+        if not target.skip_ad_selector:
+            return False
+        from playwright.async_api import Error as PWError
+        from playwright.async_api import TimeoutError as PWTimeout
+        loc = page.locator(target.skip_ad_selector).first
+        try:
+            await loc.wait_for(state="visible", timeout=self._cfg.ad_timeout_s * 1000)
+            await loc.click(timeout=5000)
+        except (PWTimeout, PWError):
+            self._log.debug("no skippable ad via %s within %.0fs",
+                            target.skip_ad_selector, self._cfg.ad_timeout_s)
+            return False
+        self._log.info("skipped pre-roll ad via %s", target.skip_ad_selector)
+        await self._settle(page)
+        return True
 
     async def run_interaction(self, page, target: TargetConfig) -> None:
         """Drive the optional search -> open-result flow before locating video."""
@@ -311,55 +378,79 @@ class BrowserController:
         except PWTimeout:
             self._log.debug("networkidle not reached after interaction; continuing")
 
-    async def click_controls(self, page, video: "VideoHandle", target: TargetConfig) -> bool:
-        """Click the optional play/fullscreen controls and (if enabled) put the
-        target element into fullscreen before capture. All best-effort.
+    async def click_play(self, page, target: TargetConfig) -> bool:
+        """Click the play button (page-level) to start playback.
 
-        Returns whether the page ended up in fullscreen.
+        On many sites this is what triggers a pre-roll ad, so it must happen
+        *before* :meth:`skip_ad`. No-op (returns False) if no play selector is
+        configured — :meth:`try_play` is the programmatic fallback. Best-effort.
         """
+        if not target.play_selector:
+            return False
+        ok = await self._click_selector(
+            page, target.play_selector, timeout_ms=self._cfg.play_confirm_timeout_s * 1000)
+        if ok:
+            self._log.info("clicked play control (%s)", target.play_selector)
+        else:
+            self._log.debug("play control %r not actionable", target.play_selector)
+        return ok
+
+    async def go_fullscreen(self, page, video: "VideoHandle", target: TargetConfig) -> bool:
+        """Put the target element into fullscreen before capture (best-effort).
+
+        Clicks a site fullscreen button if configured, otherwise requests the
+        Fullscreen API on ``fullscreen_target`` (or the video). Returns whether
+        the page ended up in fullscreen. Does NOT click play (see click_play).
+        """
+        if not self._cfg.fullscreen:
+            return False
+
         from playwright.async_api import Error as PWError
         from playwright.async_api import TimeoutError as PWTimeout
 
-        clicked_any = False
-        for selector, what in ((target.play_selector, "play"),
-                               (target.fullscreen_selector, "fullscreen")):
-            if not selector:
-                continue
+        clicked_fs = False
+        if target.fullscreen_selector:
             try:
-                ctrl = page.locator(selector).first
+                ctrl = page.locator(target.fullscreen_selector).first
                 await ctrl.wait_for(state="visible", timeout=5000)
                 await ctrl.click(timeout=5000)
-                clicked_any = True
-                self._log.info("clicked %s control (%s)", what, selector)
+                clicked_fs = True
+                self._log.info("clicked fullscreen control (%s)", target.fullscreen_selector)
             except (PWTimeout, PWError) as e:
-                # Fullscreen often needs a real gesture / can be denied in
-                # headless; a missing play button is fine because try_play()
-                # is the programmatic fallback. Don't fail the whole check.
-                self._log.debug("%s control %r not actionable: %s", what, selector, e)
+                self._log.debug("fullscreen control %r not actionable: %s",
+                                target.fullscreen_selector, e)
 
-        if not self._cfg.fullscreen:
+        # If a site control already entered fullscreen on the right element,
+        # respect it — don't override with a programmatic request elsewhere.
+        try:
+            if await page.evaluate("() => !!document.fullscreenElement"):
+                self._log.info("already fullscreen via site control")
+                return True
+        except Exception:  # noqa: BLE001 - fall through to programmatic request
+            pass
+        return await self._ensure_fullscreen(page, video, target, had_gesture=clicked_fs)
+
+    async def _request_fs(self, fs_locator) -> bool:
+        try:
+            return bool(await fs_locator.evaluate(_REQUEST_FS_JS))
+        except Exception as e:  # noqa: BLE001 - never fail the check on fullscreen
+            self._log.debug("fullscreen request errored: %s", e)
             return False
-        return await self._ensure_fullscreen(page, video, target, had_gesture=clicked_any)
 
     async def _ensure_fullscreen(
         self, page, video: "VideoHandle", target: TargetConfig, *, had_gesture: bool
     ) -> bool:
-        """Best-effort: put the configured element into the browser Fullscreen state.
+        """Programmatically request fullscreen on the configured element.
 
-        Requests fullscreen on ``target.fullscreen_target`` if set (some players,
-        e.g. YouTube, manage fullscreen on a container rather than the <video>),
-        otherwise on the video element. The Fullscreen API needs transient user
-        activation: a real control click provides it, else we click the video
-        once (try_play() re-starts playback regardless).
+        Requests fullscreen on ``fullscreen_target`` if set (some players, e.g.
+        YouTube, manage fullscreen on a container rather than the <video>), else
+        on the video element. The Fullscreen API needs transient user activation:
+        we first try using activation from a recent click (e.g. the skip-ad
+        click); only if that fails and we have no gesture do we click the video
+        (which try_play() will re-start if it pauses).
         """
         from playwright.async_api import Error as PWError
         from playwright.async_api import TimeoutError as PWTimeout
-
-        if not had_gesture:
-            try:
-                await video.locator.click(timeout=4000)
-            except (PWTimeout, PWError):
-                self._log.debug("could not click video for fullscreen gesture")
 
         if target.fullscreen_target:
             fs_locator = page.locator(target.fullscreen_target).first
@@ -368,19 +459,25 @@ class BrowserController:
             fs_locator = video.locator
             what = "video element"
 
-        try:
-            ok = bool(await fs_locator.evaluate(_REQUEST_FS_JS))
-        except Exception as e:  # noqa: BLE001 - never fail the check on fullscreen
-            self._log.warning("fullscreen request on %s errored: %s", what, e)
-            return False
-        if ok:
+        # Attempt 1: use any activation we already have.
+        if await self._request_fs(fs_locator):
             self._log.info("entered fullscreen on %s", what)
-        else:
-            self._log.warning(
-                "fullscreen NOT achieved on %s (continuing). If this is a custom "
-                "player, pass --fullscreen-id / --fullscreen-target for the right "
-                "element.", what)
-        return ok
+            return True
+
+        # Attempt 2: manufacture a gesture by clicking the video, then retry.
+        if not had_gesture:
+            try:
+                await video.locator.click(timeout=4000)
+            except (PWTimeout, PWError):
+                self._log.debug("could not click video for fullscreen gesture")
+            if await self._request_fs(fs_locator):
+                self._log.info("entered fullscreen on %s", what)
+                return True
+
+        self._log.warning(
+            "fullscreen NOT achieved on %s (continuing). For a custom player, "
+            "pass --fullscreen-id / --fullscreen-target for the right element.", what)
+        return False
 
     async def goto(self, page, url: str) -> None:
         from playwright.async_api import Error as PWError
