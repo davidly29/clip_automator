@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VPV fixture: frozen</title>
+<!--
+  A video element fed from a canvas that is drawn exactly once. The stream
+  technically "plays" (currentTime may advance) but the rendered frames never
+  change, so VPV should FAIL with frozen_frames.
+-->
+<video id="vid" muted autoplay playsinline width="320" height="180"></video>
+<canvas id="cv" width="320" height="180" style="display:none"></canvas>
+<script>
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  // Draw a single, non-blank, static frame.
+  ctx.fillStyle = '#204060';
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = '#d0d0d0';
+  ctx.fillRect(120, 60, 80, 60);
+  const stream = cv.captureStream(30);
+  const vid = document.getElementById('vid');
+  vid.srcObject = stream;
+  vid.play().catch(() => {});
+</script>

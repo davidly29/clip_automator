@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VPV fixture: fullscreen on a container, not the video</title>
+<!--
+  Mimics players (e.g. YouTube) that go fullscreen on a wrapping container
+  rather than the <video> itself. The video element's own requestFullscreen is
+  not what we want here; VPV must fullscreen #wrap (via --fullscreen-id/target).
+-->
+<div id="wrap">
+  <video id="player" muted playsinline width="320" height="180"></video>
+</div>
+<button id="play">Play</button>
+<canvas id="cv" width="320" height="180" style="display:none"></canvas>
+<script>
+  const $ = (id) => document.getElementById(id);
+  $('play').addEventListener('click', () => {
+    const cv = $('cv'), ctx = cv.getContext('2d');
+    let t = 0;
+    (function draw() {
+      t += 1;
+      ctx.fillStyle = '#101820';
+      ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.fillStyle = `hsl(${t % 360}, 90%, 55%)`;
+      ctx.fillRect((t * 4) % cv.width, 60, 60, 60);
+      requestAnimationFrame(draw);
+    })();
+    const p = $('player');
+    p.srcObject = cv.captureStream(30);
+    p.play().catch(() => {});
+  });
+</script>

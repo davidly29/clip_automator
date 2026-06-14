@@ -1,0 +1,85 @@
+{
+  // Output directory for proof-of-playback artifacts (required, must be writable).
+  "output_dir": "./vpv-artifacts",
+
+  // How many targets to check in parallel.
+  "concurrency": 2,
+  "headless": true,
+  "browser": "chromium",          // "chromium" | "firefox" | "webkit"
+
+  "nav_timeout_s": 30,
+  "play_confirm_timeout_s": 10,
+  "retries": 1,
+  "log_level": "INFO",
+
+  // Auto-click common consent / "Accept all" buttons before interacting.
+  // On by default and scales across sites; set false to rely only on a
+  // per-target "dismiss_selector"/"dismiss_id".
+  "auto_dismiss_consent": true,
+  // Override the accept-button phrases the heuristic matches (replaces the
+  // built-in list). Useful for other languages or wording like "Enter site".
+  // "consent_texts": ["Accept all", "Zustimmen", "Enter site"],
+  // Put the video into fullscreen before capture (best-effort; needs a user
+  // gesture, which VPV supplies). Set false to capture at the player's inline size.
+  "fullscreen": true,
+  // Seed the random video picker for reproducible runs (null = nondeterministic).
+  "random_seed": null,
+
+  // Provide an identifiable User-Agent so operators are transparent about checks.
+  "user_agent": "VPV-Monitor/1.0 (+qa-team@example.com)",
+
+  "capture": {
+    // "frames": sample screenshots (fast, no deps).
+    // "clip":   record an actual playable video (ffmpeg is bundled via imageio-ffmpeg).
+    "mode": "clip",
+    "duration_s": 4.0,
+    "interval_ms": 500,           // only used when frame_count is null
+    "frame_count": 2,             // default 2 screenshots; set null for duration/interval sampling
+    "width": null,                // optional downscale
+    "height": null
+  },
+
+  "verification": {
+    "min_time_advance_s": 0.25,
+    "frozen_frame_threshold": 2.0,
+    "blank_frame_max_variance": 1.0
+  },
+
+  "targets": [
+    // Simple case: the page already contains a <video>.
+    { "url": "https://example.com/watch/123", "video_selector": "video", "video_index": 0 },
+
+    // Parameterized, search-driven case. VPV will:
+    //   1. open the URL
+    //   2. dismiss a consent modal (auto, or via dismiss_id/dismiss_selector)
+    //   3. type "search_query" into the search bar ("search_id" or "search_selector")
+    //   4. submit ("search_submit" button, or Enter if omitted)
+    //   5. click "result_selector" to open the video
+    //   6. click "play_selector" then "fullscreen_selector"
+    //   7. capture + verify the video, saving a clip.
+    {
+      "url": "https://videosite.example/",
+      "dismiss_id": "accept-cookies",         // optional explicit OK button (=> "#accept-cookies")
+      "search_id": "search",                 // HTML id of the search bar (=> "#search")
+      // "search_selector": "input[name=q]",  // ...or a full CSS selector instead
+      "search_query": "nature documentary",
+      "search_submit": "button.search-go",   // optional; omit to press Enter
+      "result_selector": ".result a",         // first match is clicked
+      "video_selector": "video",
+      "play_selector": ".vjs-play-control",
+      "fullscreen_selector": ".vjs-fullscreen-control",
+      // Element to make fullscreen. Many players (e.g. YouTube) fullscreen a
+      // container, not the <video>. Omit to fullscreen the video element.
+      "fullscreen_id": "player-full-bleed-container"
+    },
+
+    // Random-pick case: land on the homepage and open one of these videos at
+    // random (handy for spreading synthetic checks across content).
+    {
+      "url": "https://videosite.example/",
+      "random_ids": ["featured-1", "featured-2", "trending-1", "trending-2"],
+      "video_selector": "video",
+      "play_selector": ".vjs-play-control"
+    }
+  ]
+}

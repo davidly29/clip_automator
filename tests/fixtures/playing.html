@@ -1,0 +1,29 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VPV fixture: playing</title>
+<!--
+  A genuinely playing video, with no media file: an animated canvas is piped
+  into a <video> via captureStream(). currentTime advances and the rendered
+  frames change over time, so VPV should PASS.
+-->
+<video id="vid" muted autoplay playsinline width="320" height="180"></video>
+<canvas id="cv" width="320" height="180" style="display:none"></canvas>
+<script>
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  let t = 0;
+  function draw() {
+    t += 1;
+    ctx.fillStyle = '#101820';
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    const x = (t * 4) % cv.width;
+    ctx.fillStyle = `hsl(${t % 360}, 90%, 55%)`;
+    ctx.fillRect(x, 60, 60, 60);
+    requestAnimationFrame(draw);
+  }
+  draw();
+  const stream = cv.captureStream(30);
+  const vid = document.getElementById('vid');
+  vid.srcObject = stream;
+  vid.play().catch(() => {});
+</script>

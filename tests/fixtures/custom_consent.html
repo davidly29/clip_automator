@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VPV fixture: non-standard consent wording</title>
+<!--
+  Like homepage.html, but the entry button says "Enter site" — wording the
+  built-in accept-phrase heuristic deliberately does NOT match. Used to test
+  configurable consent_texts: only a run that supplies "Enter site" can clear
+  the blocking overlay and reach the video.
+-->
+<style>
+  #gate {
+    position: fixed; inset: 0; background: rgba(0,0,0,.7);
+    display: flex; align-items: center; justify-content: center; z-index: 10;
+  }
+  #stage { display: none; }
+</style>
+
+<div id="gate">
+  <div><p>Age check</p><button id="enter">Enter site</button></div>
+</div>
+
+<h1>Tiny Tube</h1>
+<button id="v1">Clip One</button>
+<div id="stage"><video id="player" muted playsinline width="320" height="180"></video></div>
+<canvas id="cv" width="320" height="180" style="display:none"></canvas>
+<script>
+  const $ = (id) => document.getElementById(id);
+  $('enter').addEventListener('click', () => { $('gate').remove(); });
+  $('v1').addEventListener('click', () => {
+    $('stage').style.display = 'block';
+    const cv = $('cv'), ctx = cv.getContext('2d');
+    let t = 0;
+    (function draw() {
+      t += 1;
+      ctx.fillStyle = '#101820';
+      ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.fillStyle = `hsl(${t % 360}, 90%, 55%)`;
+      ctx.fillRect((t * 4) % cv.width, 60, 60, 60);
+      requestAnimationFrame(draw);
+    })();
+    const p = $('player');
+    p.srcObject = cv.captureStream(30);
+    p.play().catch(() => {});
+  });
+</script>

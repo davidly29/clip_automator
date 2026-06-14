@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VPV fixture: broken source</title>
+<!--
+  A <video> pointing at a source that does not exist. The element fires an
+  error / never reaches readyState>=2, so VPV should FAIL (media_error).
+-->
+<video id="vid" muted autoplay playsinline width="320" height="180"
+       src="does-not-exist.mp4"></video>

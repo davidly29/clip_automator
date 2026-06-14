@@ -1,0 +1,30 @@
+# Virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# VPV runtime output (proof-of-playback artifacts)
+vpv-artifacts/
+_smoke*/
+_fs_smoke*/
+
+# IDE / editor
+.idea/
+*.iml
+.vscode/
+
+# OS cruft
+.DS_Store
+Thumbs.db

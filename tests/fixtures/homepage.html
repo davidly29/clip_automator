@@ -1,0 +1,66 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VPV fixture: homepage with consent + random videos</title>
+<!--
+  Exercises two features together:
+    1. A consent modal overlays the page and blocks interaction until its OK
+       button (#accept, accessible name "Accept all") is clicked.
+    2. A grid of video thumbnails (#v1 #v2 #v3); clicking any one opens a
+       genuinely-playing canvas-captureStream video (#player).
+-->
+<style>
+  #consent {
+    position: fixed; inset: 0; background: rgba(0,0,0,.7);
+    display: flex; align-items: center; justify-content: center; z-index: 10;
+  }
+  #consent .box { background: #fff; padding: 24px; border-radius: 8px; }
+  #stage { display: none; }
+  .thumb { width: 120px; height: 70px; margin: 6px; }
+</style>
+
+<div id="consent">
+  <div class="box">
+    <p>We use cookies to make Tiny Tube work.</p>
+    <button id="accept">Accept all</button>
+  </div>
+</div>
+
+<h1>Tiny Tube</h1>
+<div id="grid">
+  <button class="thumb" id="v1">Clip One</button>
+  <button class="thumb" id="v2">Clip Two</button>
+  <button class="thumb" id="v3">Clip Three</button>
+</div>
+
+<div id="stage">
+  <video id="player" muted playsinline width="320" height="180"></video>
+</div>
+
+<canvas id="cv" width="320" height="180" style="display:none"></canvas>
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  $('accept').addEventListener('click', () => { $('consent').remove(); });
+
+  function openVideo() {
+    $('stage').style.display = 'block';
+    const cv = $('cv'), ctx = cv.getContext('2d');
+    let t = 0;
+    (function draw() {
+      t += 1;
+      ctx.fillStyle = '#101820';
+      ctx.fillRect(0, 0, cv.width, cv.height);
+      const x = (t * 4) % cv.width;
+      ctx.fillStyle = `hsl(${t % 360}, 90%, 55%)`;
+      ctx.fillRect(x, 60, 60, 60);
+      requestAnimationFrame(draw);
+    })();
+    const p = $('player');
+    p.srcObject = cv.captureStream(30);
+    p.play().catch(() => {});
+  }
+
+  for (const id of ['v1', 'v2', 'v3']) {
+    $(id).addEventListener('click', openVideo);
+  }
+</script>

@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VPV fixture: consent that navigates</title>
+<!--
+  Reproduces the real-world case (e.g. YouTube) where clicking the consent
+  button NAVIGATES to another page. This used to destroy the execution context
+  mid-flow and crash the whole run; VPV must now settle after dismissal and
+  carry on against the destination page.
+-->
+<div id="consent" style="position:fixed;inset:0;background:rgba(0,0,0,.7)">
+  <button id="accept" aria-label="Accept all">Accept all</button>
+</div>
+<script>
+  document.getElementById('accept').addEventListener('click', () => {
+    // Simulate a consent-page redirect into the actual site.
+    window.location.href = 'playing.html';
+  });
+</script>

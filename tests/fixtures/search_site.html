@@ -1,0 +1,68 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VPV fixture: search-driven video site</title>
+<!--
+  A miniature "video website" that exercises the full parameterized flow:
+    1. type a query into the search bar (#search)
+    2. submit (#go button, or Enter)
+    3. click a result (#result-0) to open the player
+    4. click play (#play) and fullscreen (#fs)
+    5. a canvas-captureStream <video id="player"> then plays (frames move).
+-->
+<style>
+  #results, #stage { display: none; }
+  .result { cursor: pointer; color: #06c; text-decoration: underline; }
+</style>
+
+<h1>Tiny Tube</h1>
+<input id="search" type="text" placeholder="Search videos…" aria-label="search">
+<button id="go">Search</button>
+
+<div id="results">
+  <p class="result" id="result-0">First matching clip »</p>
+</div>
+
+<div id="stage">
+  <video id="player" muted playsinline width="320" height="180"></video>
+  <div>
+    <button id="play">Play</button>
+    <button id="fs">Fullscreen</button>
+  </div>
+</div>
+
+<canvas id="cv" width="320" height="180" style="display:none"></canvas>
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  function showResults() {
+    if ($('search').value.trim().length > 0) {
+      $('results').style.display = 'block';
+    }
+  }
+  $('go').addEventListener('click', showResults);
+  $('search').addEventListener('keydown', (e) => { if (e.key === 'Enter') showResults(); });
+
+  $('result-0').addEventListener('click', () => {
+    $('stage').style.display = 'block';
+
+    // Animate a canvas and pipe it into the <video> so it genuinely plays.
+    const cv = $('cv'), ctx = cv.getContext('2d');
+    let t = 0;
+    (function draw() {
+      t += 1;
+      ctx.fillStyle = '#101820';
+      ctx.fillRect(0, 0, cv.width, cv.height);
+      const x = (t * 4) % cv.width;
+      ctx.fillStyle = `hsl(${t % 360}, 90%, 55%)`;
+      ctx.fillRect(x, 60, 60, 60);
+      requestAnimationFrame(draw);
+    })();
+    $('player').srcObject = cv.captureStream(30);
+  });
+
+  $('play').addEventListener('click', () => { $('player').play().catch(() => {}); });
+  $('fs').addEventListener('click', () => {
+    const el = $('player');
+    if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+  });
+</script>
