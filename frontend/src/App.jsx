@@ -121,6 +121,146 @@ function Feed({ videos, muted, fit, startIndex }) {
   )
 }
 
+const VIDEO_RE = /\.(mp4|webm|mov|m4v|ogg|ogv)$/i
+const isVideoFile = (f) => (f.type && f.type.startsWith('video/')) || VIDEO_RE.test(f.name)
+
+// Studio: drop 1-3 clips into the placeholders — either from the folder palette
+// or dragged in from the desktop (uploaded) — then render a single side-by-side
+// video (with sound) via the /api/compose endpoint.
+function Studio({ videos }) {
+  const [slots, setSlots] = useState([null, null, null])
+  const [uploads, setUploads] = useState([])
+  const [result, setResult] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+
+  const palette = [...uploads, ...videos]
+  const setSlot = (i, item) => setSlots((s) => s.map((x, j) => (j === i ? item : x)))
+  const chosen = slots.filter(Boolean)
+
+  const uploadFile = async (file) => {
+    try {
+      const r = await fetch(`/api/upload?name=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': file.type || 'application/octet-stream' },
+        body: file,
+      })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
+      setUploads((u) => (u.some((x) => x.src === data.src) ? u : [data, ...u]))
+      return data
+    } catch (e) {
+      setError(String(e.message || e))
+      return null
+    }
+  }
+
+  const addFiles = async (fileList) => {
+    const files = [...fileList].filter(isVideoFile)
+    if (files.length === 0) return null
+    setBusy(true); setError(null)
+    let first = null
+    for (const f of files) {
+      const item = await uploadFile(f)
+      if (item && !first) first = item
+    }
+    setBusy(false)
+    return first
+  }
+
+  const onDrop = (i) => async (e) => {
+    e.preventDefault()
+    if (e.dataTransfer.files && e.dataTransfer.files.length) {
+      const item = await addFiles(e.dataTransfer.files)
+      if (item) setSlot(i, item)
+      return
+    }
+    const idx = e.dataTransfer.getData('text/plain')
+    if (idx !== '') setSlot(i, palette[+idx])
+  }
+
+  const render = async () => {
+    setBusy(true); setError(null); setResult(null)
+    try {
+      const r = await fetch('/api/compose', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clips: chosen.map((c) => c.src) }),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
+      setResult(data.src)
+    } catch (e) {
+      setError(String(e.message || e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="studio">
+      <div className="slots">
+        {slots.map((item, i) => (
+          <div
+            key={i}
+            className={`slot ${item ? 'filled' : ''}`}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={onDrop(i)}
+          >
+            {item ? (
+              <>
+                {item.poster ? <img src={item.poster} alt="" /> : <div className="noposter" />}
+                <span className="slot-label">{item.label}</span>
+                <button className="slot-x" title="Remove" onClick={() => setSlot(i, null)}>×</button>
+              </>
+            ) : (
+              <span className="slot-hint">Drop clip {i + 1}</span>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <div className="studio-actions">
+        <button className="render-btn" disabled={busy || chosen.length === 0} onClick={render}>
+          {busy ? 'Working…' : `Render ${chosen.length || ''} side by side`}
+        </button>
+        <label className="upload-btn">
+          Add files
+          <input
+            type="file"
+            accept="video/*"
+            multiple
+            hidden
+            onChange={(e) => { addFiles(e.target.files); e.target.value = '' }}
+          />
+        </label>
+        {error && <span className="studio-err">{error}</span>}
+      </div>
+
+      <p className="studio-tip">Drag clips below into a slot, or drop video files from your desktop onto a slot.</p>
+
+      {result && (
+        <video className="studio-result" src={result} controls autoPlay key={result} />
+      )}
+
+      <div className="palette">
+        {palette.map((vid, i) => (
+          <div
+            className="pal-item"
+            key={vid.src}
+            draggable
+            onDragStart={(e) => e.dataTransfer.setData('text/plain', String(i))}
+            title={vid.label}
+          >
+            {vid.poster ? <img src={vid.poster} alt="" loading="lazy" /> : <div className="noposter" />}
+            <span className="cell-label">{vid.label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function Grid({ videos, onPick }) {
   return (
     <div className="grid">
@@ -183,8 +323,12 @@ export default function App() {
             {fit === 'contain' ? '⤢' : '▭'}
           </button>
           <button className="icon" title="Toggle view (grid/feed)"
-            onClick={() => setView((v) => (v === 'feed' ? 'grid' : 'feed'))}>
-            {view === 'feed' ? '▦' : '▤'}
+            onClick={() => setView((v) => (v === 'grid' ? 'feed' : 'grid'))}>
+            {view === 'grid' ? '▤' : '▦'}
+          </button>
+          <button className={`icon ${view === 'studio' ? 'active' : ''}`} title="Studio — combine clips side by side"
+            onClick={() => setView((v) => (v === 'studio' ? 'feed' : 'studio'))}>
+            ⊞
           </button>
           <button className="icon" title="Toggle sound (m)" onClick={() => setMuted((m) => !m)}>
             {muted ? '🔇' : '🔊'}
@@ -196,6 +340,8 @@ export default function App() {
         <div className="center"><div className="skeleton" /></div>
       ) : error ? (
         <div className="center msg">Couldn’t load clips: {error}</div>
+      ) : view === 'studio' ? (
+        <Studio videos={videos} />
       ) : shown.length === 0 ? (
         <div className="center msg">
           {videos.length === 0

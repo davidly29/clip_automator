@@ -14,17 +14,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
+import subprocess
 import sys
 import webbrowser
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from mimetypes import guess_type
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 VIDEO_EXTS = {".mp4", ".webm", ".mov", ".m4v", ".ogg", ".ogv"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 MEDIA_EXTS = VIDEO_EXTS | IMAGE_EXTS
+
+# Files dragged in from the desktop land here (a subfolder of the served dir).
+UPLOAD_DIR_NAME = "uploads"
+MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GiB ceiling per file
 
 # Built React SPA (vite build outputs here). Optional — falls back if absent.
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -88,6 +95,91 @@ _NOT_BUILT = (
 )
 
 
+def _safe_upload_name(raw: str) -> str | None:
+    """Sanitise an uploaded filename: strip any path, require a video extension."""
+    name = Path(raw or "").name.strip()
+    if not name or Path(name).suffix.lower() not in VIDEO_EXTS:
+        return None
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    return name or None
+
+
+def _unique_path(p: Path) -> Path:
+    """Return p, or p-1/p-2/... if it already exists (never clobber)."""
+    if not p.exists():
+        return p
+    i = 1
+    while True:
+        cand = p.with_name(f"{p.stem}-{i}{p.suffix}")
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+class ComposeError(RuntimeError):
+    """Raised when ffmpeg fails to combine clips."""
+
+
+def _ffmpeg() -> str:
+    import imageio_ffmpeg
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def _has_audio(ffmpeg: str, path: Path) -> bool:
+    """True if the file has an audio stream (parsed from ffmpeg's probe output)."""
+    proc = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", str(path)],
+        capture_output=True, text=True,
+    )
+    return "Audio:" in (proc.stderr or "")
+
+
+def _compose_filter(n: int, audio_flags: list[bool], height: int = 720) -> tuple[str, str | None]:
+    """Build (filter_complex, audio_map) to stack n clips side by side.
+
+    Each clip is scaled to a common height; clips that carry audio are mixed.
+    Returns the audio map (``"[a]"`` or ``"<idx>:a"``) or None if no clip has sound.
+    """
+    parts: list[str] = []
+    for i in range(n):
+        label = "v" if n == 1 else f"v{i}"
+        parts.append(f"[{i}:v]scale=-2:{height},setsar=1[{label}]")
+    if n > 1:
+        ins = "".join(f"[v{i}]" for i in range(n))
+        parts.append(f"{ins}hstack=inputs={n}[v]")
+
+    audio_idx = [i for i, a in enumerate(audio_flags) if a]
+    if len(audio_idx) == 1:
+        return ";".join(parts), f"{audio_idx[0]}:a"
+    if len(audio_idx) >= 2:
+        ins = "".join(f"[{i}:a]" for i in audio_idx)
+        parts.append(f"{ins}amix=inputs={len(audio_idx)}:normalize=0[a]")
+        return ";".join(parts), "[a]"
+    return ";".join(parts), None
+
+
+def compose(root: Path, inputs: list[Path], height: int = 720) -> Path:
+    """Render 1-3 clips into a single side-by-side video (with sound) under root."""
+    ffmpeg = _ffmpeg()
+    audio_flags = [_has_audio(ffmpeg, p) for p in inputs]
+    filt, amap = _compose_filter(len(inputs), audio_flags, height)
+    out = root / f"compose-{datetime.now():%Y%m%d-%H%M%S}.mp4"
+
+    cmd = [ffmpeg, "-y"]
+    for p in inputs:
+        cmd += ["-i", str(p)]
+    cmd += ["-filter_complex", filt, "-map", "[v]"]
+    if amap:
+        cmd += ["-map", amap, "-c:a", "aac"]
+    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+            "-movflags", "+faststart", str(out)]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not out.is_file():
+        raise ComposeError((proc.stderr or "ffmpeg failed").strip()[-800:])
+    return out
+
+
 class _Handler(BaseHTTPRequestHandler):
     root: Path = Path(".")
 
@@ -103,10 +195,86 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._serve_app(path)
 
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/api/compose":
+            self._compose()
+        elif path == "/api/upload":
+            self._upload()
+        else:
+            self.send_error(404, "Not found")
+
+    # --- upload (drag files in from the desktop) ---
+    def _upload(self):
+        qs = parse_qs(urlparse(self.path).query)
+        name = _safe_upload_name((qs.get("name") or [""])[0])
+        if name is None:
+            self._send_json({"error": "unsupported or invalid filename"}, status=400)
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            self._send_json({"error": "empty upload"}, status=400)
+            return
+        if length > MAX_UPLOAD_BYTES:
+            self._send_json({"error": "file too large"}, status=413)
+            return
+        dest_dir = self.root / UPLOAD_DIR_NAME
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = _unique_path(dest_dir / name)
+        remaining = length
+        try:
+            with open(dest, "wb") as f:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+        except OSError as e:
+            dest.unlink(missing_ok=True)
+            self._send_json({"error": f"could not save: {e}"}, status=500)
+            return
+        self._send_json({
+            "src": _media_url(dest, self.root),
+            "poster": None,
+            "label": dest.stem,
+            "passed": None,
+            "code": None,
+            "reasons": [],
+            "captured_at": None,
+        })
+
+    # --- compose (combine 1-3 clips side by side) ---
+    def _compose(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except (json.JSONDecodeError, ValueError):
+            self._send_json({"error": "invalid JSON"}, status=400)
+            return
+        rels = body.get("clips")
+        if not isinstance(rels, list) or not (1 <= len(rels) <= 3):
+            self._send_json({"error": "provide 1-3 clips"}, status=400)
+            return
+        inputs: list[Path] = []
+        for r in rels:
+            rel = r[len("/media/"):] if isinstance(r, str) and r.startswith("/media/") else r
+            target = self._resolve(rel) if isinstance(rel, str) else None
+            if target is None:
+                self._send_json({"error": f"clip not found: {r}"}, status=400)
+                return
+            inputs.append(target)
+        try:
+            out = compose(self.root, inputs)
+        except ComposeError as e:
+            self._send_json({"error": str(e)}, status=500)
+            return
+        self._send_json({"src": _media_url(out, self.root)})
+
     # --- responses ---
-    def _send_json(self, obj):
+    def _send_json(self, obj, status: int = 200):
         data = json.dumps(obj).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
