@@ -157,3 +157,37 @@ def test_media_path_traversal_blocked(server):
     with pytest.raises(urllib.error.HTTPError) as ei:
         urllib.request.urlopen(server + "/media/..%2f..%2fetc%2fpasswd")
     assert ei.value.code == 404
+
+
+def test_api_videos_includes_signals_from_metadata(tmp_path):
+    """signals from the verdict should be exposed in the API response."""
+    import json as json_mod
+    clip_dir = tmp_path / "20260614-090000_example.com_idx0"
+    clip_dir.mkdir(parents=True)
+    _make_video(clip_dir / "snippet.mp4")
+    meta = {
+        "captured_at": "2026-06-14T09:00:00+00:00",
+        "verdict": {
+            "passed": True,
+            "code": "pass",
+            "reasons": ["currentTime advanced 3.500s (>= 0.25s)", "frames moving (motion 12.3)"],
+            "signals": {"time_advance_s": 3.5, "time_advanced": True, "motion_score": 12.3},
+        },
+    }
+    (clip_dir / "metadata.json").write_text(json_mod.dumps(meta), encoding="utf-8")
+
+    items = viewer.api_videos(tmp_path)
+    assert len(items) == 1
+    item = items[0]
+    assert item["signals"]["time_advance_s"] == 3.5
+    assert item["signals"]["motion_score"] == 12.3
+    assert item["passed"] is True
+    assert item["code"] == "pass"
+
+
+def test_api_videos_signals_empty_when_no_metadata(tmp_path):
+    """signals should be an empty dict when there is no metadata.json."""
+    _make_video(tmp_path / "bare.mp4")
+    items = viewer.api_videos(tmp_path)
+    assert len(items) == 1
+    assert items[0]["signals"] == {}

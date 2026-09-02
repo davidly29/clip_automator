@@ -394,6 +394,32 @@ Notes:
   **dev-only** tooling (Vite/esbuild dev server). These don't affect the shipped
   viewer in `src/vpv/web/` or `vpv-view` at run time (no Node is used to run it).
 
+## Deploy the viewer (Docker / Railway)
+
+The **viewer** (`vpv-view`) is the deployable web service — it serves the SPA,
+streams clips, and composes side-by-side videos. (The `vpv` verifier is a local
+browser-automation CLI and is not part of the deployed image.)
+
+The [`Dockerfile`](./Dockerfile) is a two-stage build: Node builds the SPA, then
+a slim Python image installs the package and runs `vpv-view`. No Playwright
+browsers or system ffmpeg are needed — the viewer only uses the ffmpeg bundled
+by `imageio-ffmpeg`. The entrypoint reads `$PORT`, `$HOST`, and `$VPV_VIEW_DIR`
+from the environment (the image defaults `HOST=0.0.0.0`, `VPV_VIEW_DIR=/data`).
+
+Build and run locally:
+
+```bash
+docker build -t vpv-viewer .
+docker run --rm -p 8000:8000 -e PORT=8000 -v "$PWD/vpv-artifacts:/data" vpv-viewer
+# open http://localhost:8000
+```
+
+**Railway:** the repo includes [`railway.json`](./railway.json) pinning the
+Dockerfile builder and a `/` health check. Create a service from this repo —
+Railway injects `$PORT` automatically, so no config is required to boot. To keep
+uploaded/rendered clips across deploys, attach a **Volume** mounted at `/data`
+(otherwise `/data` is ephemeral, which is fine for a stateless demo).
+
 ## Failure codes
 
 `nav_timeout`, `video_not_found`, `not_a_media_element`, `autoplay_blocked`,

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -78,6 +79,7 @@ def api_videos(root: Path) -> list[dict]:
             "passed": verdict.get("passed"),
             "code": verdict.get("code"),
             "reasons": verdict.get("reasons") or [],
+            "signals": verdict.get("signals") or {},
             "captured_at": (meta or {}).get("captured_at"),
         })
     return items
@@ -392,9 +394,10 @@ class _Handler(BaseHTTPRequestHandler):
 
 def serve(directory: Path, host: str, port: int, open_browser: bool) -> int:
     directory = directory.expanduser().resolve()
-    if not directory.is_dir():
-        sys.stderr.write(f"error: directory not found: {directory}\n")
+    if directory.exists() and not directory.is_dir():
+        sys.stderr.write(f"error: not a directory: {directory}\n")
         return 2
+    directory.mkdir(parents=True, exist_ok=True)  # create on first run (e.g. an empty volume)
     handler = type("BoundHandler", (_Handler,), {"root": directory})
     httpd = ThreadingHTTPServer((host, port), handler)
     actual_port = httpd.server_address[1]
@@ -419,14 +422,21 @@ def serve(directory: Path, host: str, port: int, open_browser: bool) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    # Defaults come from the environment so the same entrypoint works locally and
+    # on hosts like Railway (which inject PORT and, for us, HOST/VPV_VIEW_DIR).
+    default_dir = os.environ.get("VPV_VIEW_DIR", "./vpv-artifacts")
+    default_host = os.environ.get("HOST", "127.0.0.1")
+    default_port = int(os.environ.get("PORT", "8000"))
     p = argparse.ArgumentParser(
         prog="vpv-view",
         description="View captured clips in a vertical, scroll-snapping feed (view-only).",
     )
-    p.add_argument("--dir", type=Path, default=Path("./vpv-artifacts"),
-                   help="Folder to scan for videos (default: ./vpv-artifacts).")
-    p.add_argument("--host", default="127.0.0.1", help="Host to bind (default: 127.0.0.1).")
-    p.add_argument("--port", type=int, default=8000, help="Port (default: 8000; 0 = auto).")
+    p.add_argument("--dir", type=Path, default=Path(default_dir),
+                   help="Folder to scan for videos (default: $VPV_VIEW_DIR or ./vpv-artifacts).")
+    p.add_argument("--host", default=default_host,
+                   help="Host to bind (default: $HOST or 127.0.0.1).")
+    p.add_argument("--port", type=int, default=default_port,
+                   help="Port (default: $PORT or 8000; 0 = auto).")
     p.add_argument("--open", action="store_true", help="Open the viewer in a browser.")
     args = p.parse_args(argv)
     return serve(args.dir, args.host, args.port, args.open)
