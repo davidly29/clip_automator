@@ -61,11 +61,15 @@ settings once as a **profile** and just reuse it:
 vpv --profile <yoursite>
 ```
 
-**3. View the captured clips** in a vertical, TikTok-style scrolling feed:
+**3. Open the control panel** to launch checks from a browser and view clips
+(Verify · Runs · Library · Feed · Studio):
 
 ```powershell
 vpv-view --dir ./vpv-artifacts --open
 ```
+
+Set `VPV_ADMIN_PASSWORD` (env or a gitignored `.env`) to require login; leave it
+unset to run open locally. See [Control panel](#control-panel-vpv-view).
 
 **Run the tests** (optional):
 
@@ -352,27 +356,51 @@ Each target writes a directory named
 `frame_NNN.png` files (and `snippet.mp4` in clip mode), plus a
 `metadata.json` sidecar with the verdict, media snapshots, and the config used.
 
-## Viewing captured clips
+## Control panel (`vpv-view`)
 
-A bundled, view-only player renders the clips in a folder as a full-screen,
-vertically scroll-snapping feed (TikTok-style — no comments, likes, or other
-social features; just the videos):
+`vpv-view` is a web control panel that both **runs checks** and **views the
+results**. It has five tabs:
+
+- **Verify** — enter a URL and (optionally) selectors, then launch a check. The
+  run happens in the background; the panel drives the same `vpv` engine.
+- **Runs** — live status of each check (queued → running → pass/fail/error),
+  with reasons and signals.
+- **Library** — every captured clip as a grid; click one to play it (with its
+  verdict badge and poster from `frame_000.png` / `metadata.json`).
+- **Feed** — a full-screen, vertically scroll-snapping player (↑/↓ / space to
+  move; tap to pause; `m` to mute; a fit/fill toggle).
+- **Studio** — combine up to 3 clips side by side into one video (with sound);
+  drag from the library or drop video files in from your desktop.
 
 ```bash
 vpv-view --dir ./vpv-artifacts --open
 ```
 
-Then scroll (or use ↑/↓ / space) to move between clips. The clip in view
-autoplays muted and loops; tap a video to pause/resume; the toolbar has a
-sound toggle, a **grid ⇄ feed** switch, and **pass / fail** filters. Each clip
-shows a poster thumbnail (from the captured `frame_000.png`) and its verdict
-badge (from `metadata.json`). Options: `--port` (default 8000), `--host`,
-`--open`. Also runs as `python -m vpv.viewer`.
+Options: `--port` (default `$PORT` or 8000), `--host` (default `$HOST` or
+127.0.0.1), `--dir` (default `$VPV_VIEW_DIR` or `./vpv-artifacts`), `--open`.
+Also runs as `python -m vpv.viewer`.
 
-The UI is a small **React (Vite)** SPA in [`frontend/`](./frontend) backed by a
-JSON API (`GET /api/videos`) and range-streamed `/media/...` from the Python
-server (stdlib only at run time). The built app is committed to
-`src/vpv/web/`, so `vpv-view` works out of the box with no Node required.
+### Sign in / auth
+
+Auth is **enforced only when `VPV_ADMIN_PASSWORD` is set** — otherwise the panel
+runs open (handy locally; **always set a password for any network-facing
+deploy**). Credentials come from the environment (or a gitignored `.env`, see
+[`.env.example`](./.env.example)):
+
+| Variable | Purpose |
+| --- | --- |
+| `VPV_ADMIN_USER` | Login username (default `admin`). |
+| `VPV_ADMIN_PASSWORD` | Login password. Unset ⇒ auth disabled. |
+| `VPV_SESSION_SECRET` | Signing key for session cookies. Set a fixed random value so logins survive restarts; a random per-process key is used if unset. |
+
+Login issues an HttpOnly, SameSite=Lax session cookie; `/api/*` and `/media/*`
+require it, while the static SPA shell and `/healthz` are public.
+
+The UI is a **React (Vite)** SPA in [`frontend/`](./frontend) backed by a JSON
+API (`/api/videos`, `/api/run`, `/api/runs`, `/api/compose`, `/api/upload`) and
+range-streamed `/media/...` from the Python server (stdlib only at run time,
+plus Playwright for the verifier). The built app is committed to `src/vpv/web/`,
+so `vpv-view` works out of the box with no Node required.
 
 To change the UI:
 
@@ -394,31 +422,45 @@ Notes:
   **dev-only** tooling (Vite/esbuild dev server). These don't affect the shipped
   viewer in `src/vpv/web/` or `vpv-view` at run time (no Node is used to run it).
 
-## Deploy the viewer (Docker / Railway)
+## Deploy (Docker / Railway)
 
-The **viewer** (`vpv-view`) is the deployable web service — it serves the SPA,
-streams clips, and composes side-by-side videos. (The `vpv` verifier is a local
-browser-automation CLI and is not part of the deployed image.)
-
-The [`Dockerfile`](./Dockerfile) is a two-stage build: Node builds the SPA, then
-a slim Python image installs the package and runs `vpv-view`. No Playwright
-browsers or system ffmpeg are needed — the viewer only uses the ffmpeg bundled
-by `imageio-ffmpeg`. The entrypoint reads `$PORT`, `$HOST`, and `$VPV_VIEW_DIR`
-from the environment (the image defaults `HOST=0.0.0.0`, `VPV_VIEW_DIR=/data`).
+The [`Dockerfile`](./Dockerfile) builds **one image that runs both** the control
+panel and the in-container verifier: Node builds the SPA, then a Python image
+installs the package **and Chromium** (`playwright install --with-deps
+chromium`) and runs `vpv-view`. ffmpeg is bundled via `imageio-ffmpeg` (no apt
+ffmpeg needed). The entrypoint reads `$PORT`, `$HOST`, `$VPV_VIEW_DIR` from the
+environment (the image sets `HOST=0.0.0.0`, `VPV_VIEW_DIR=/data`,
+`VPV_IN_CONTAINER=1`). In-container captures run **headless with software-GL
+flags** (`--use-gl=swiftshader --disable-gpu --no-sandbox
+--disable-dev-shm-usage`) so frames aren't black.
 
 Build and run locally:
 
 ```bash
-docker build -t vpv-viewer .
-docker run --rm -p 8000:8000 -e PORT=8000 -v "$PWD/vpv-artifacts:/data" vpv-viewer
+docker build -t vpv .
+docker run --rm -p 8000:8000 \
+  -e PORT=8000 \
+  -e VPV_ADMIN_USER=admin -e VPV_ADMIN_PASSWORD=your-strong-password \
+  -e VPV_SESSION_SECRET=some-long-random-string \
+  -v "$PWD/vpv-artifacts:/data" vpv
 # open http://localhost:8000
 ```
 
 **Railway:** the repo includes [`railway.json`](./railway.json) pinning the
-Dockerfile builder and a `/` health check. Create a service from this repo —
-Railway injects `$PORT` automatically, so no config is required to boot. To keep
-uploaded/rendered clips across deploys, attach a **Volume** mounted at `/data`
-(otherwise `/data` is ephemeral, which is fine for a stateless demo).
+Dockerfile builder and a `/healthz` health check. Create a service from this
+repo, then in **Variables** set `VPV_ADMIN_PASSWORD` (and ideally
+`VPV_SESSION_SECRET` + `VPV_ADMIN_USER`). Railway injects `$PORT` automatically.
+To keep clips/uploads/runs across deploys, attach a **Volume** mounted at
+`/data` (otherwise `/data` is ephemeral).
+
+**Caveats when running the verifier in the cloud:**
+- **DRM/encrypted** sources (most big streaming sites) fail fast with
+  `protected_content` — by design; VPV never bypasses DRM.
+- A **cloud IP** may be geo- or bot-blocked by some sites; a check that works
+  from your laptop can fail from Railway.
+- **Chromium + video is memory-hungry.** Small Railway plans may OOM; the panel
+  runs **one check at a time** to reduce pressure, but give it enough RAM.
+- The image is ~0.5 GB larger than a viewer-only build (Chromium).
 
 ## Failure codes
 
@@ -462,7 +504,9 @@ src/vpv/
   orchestrator.py  Orchestrator
   logging_setup.py Structured Logger
   cli.py           Entry point (vpv)
-  viewer.py        Vertical clip viewer server + JSON API (vpv-view)
-  web/             Built React viewer SPA (served by vpv-view)
-frontend/          React (Vite) source for the viewer UI
+  viewer.py        Control-panel server + JSON API (vpv-view)
+  auth.py          Session-cookie auth for the control panel
+  jobs.py          Background verification-run manager
+  web/             Built React control-panel SPA (served by vpv-view)
+frontend/          React (Vite) source for the control-panel UI
 ```

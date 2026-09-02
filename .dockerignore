@@ -1,6 +1,7 @@
 # Keep the build context small and reproducible.
 .git
 .gitignore
+.env
 .venv
 .venv*
 venv

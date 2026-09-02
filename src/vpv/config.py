@@ -682,3 +682,135 @@ def _check_writable(output_dir: Path) -> None:
 def with_overrides(cfg: RunConfig, **kw) -> RunConfig:
     """Test helper: produce a copy of a RunConfig with fields replaced."""
     return replace(cfg, **kw)
+
+
+# --- Build a RunConfig from UI-submitted params (no argparse/files) -----------
+def _as_str(v) -> str | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _as_str_list(v) -> tuple[str, ...]:
+    if v is None:
+        return ()
+    if isinstance(v, str):
+        items = [x.strip() for x in v.split(",")]
+    elif isinstance(v, (list, tuple)):
+        items = [str(x).strip() for x in v]
+    else:
+        return ()
+    return tuple(x for x in items if x)
+
+
+def _as_float(v, field: str) -> float | None:
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{field} must be a number, got {v!r}") from None
+
+
+def _as_int(v, field: str) -> int | None:
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{field} must be an integer, got {v!r}") from None
+
+
+def _as_bool(v, default: bool) -> bool:
+    if v is None or v == "":
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("true", "1", "yes", "on")
+
+
+def build_run_config(
+    params: dict,
+    *,
+    output_dir: Path,
+    extra_browser_args: tuple[str, ...] = (),
+) -> RunConfig:
+    """Build a validated single-target RunConfig from a UI/JSON param dict.
+
+    Only a curated set of keys is honoured (see below). ``headless`` and
+    ``concurrency`` are fixed (the server runs one browserless-display check at
+    a time); ``extra_browser_args`` are appended to any caller-supplied
+    ``browser_args`` so the container can force software rendering. Raises
+    :class:`ConfigError` (notably when ``url`` is missing/invalid).
+    """
+    if not isinstance(params, dict):
+        raise ConfigError("run params must be an object")
+
+    url = _as_str(params.get("url"))
+    if not url:
+        raise ConfigError("url is required")
+
+    # ids are a friendlier way to pass an element; fold them into selectors.
+    dismiss = list(_as_str_list(params.get("dismiss_selectors")))
+    dismiss += [f"#{i}" for i in _as_str_list(params.get("dismiss_ids"))]
+
+    def _sel(sel_key: str, id_key: str) -> str | None:
+        sel = _as_str(params.get(sel_key))
+        if sel:
+            return sel
+        _id = _as_str(params.get(id_key))
+        return f"#{_id}" if _id else None
+
+    target = TargetConfig(
+        url=url,
+        video_selector=_as_str(params.get("video_selector")) or "video",
+        video_index=_as_int(params.get("video_index"), "video_index") or 0,
+        dismiss_selectors=tuple(dismiss),
+        search_selector=_sel("search_selector", "search_id"),
+        search_query=_as_str(params.get("search_query")),
+        search_submit=_as_str(params.get("search_submit")),
+        result_selector=_as_str(params.get("result_selector")),
+        random_ids=_as_str_list(params.get("random_ids")),
+        random_selector=_as_str(params.get("random_selector")),
+        skip_ad_selector=_as_str(params.get("skip_ad_selector")),
+        play_selector=_sel("play_selector", "play_id"),
+        fullscreen_selector=_sel("fullscreen_selector", "fullscreen_id"),
+        fullscreen_target=_as_str(params.get("fullscreen_target")),
+    )
+
+    mode = _as_str(params.get("mode")) or "clip"
+    if mode not in ("frames", "clip"):
+        raise ConfigError("mode must be 'frames' or 'clip'")
+    capture = CaptureConfig(
+        mode=mode,  # type: ignore[arg-type]
+        duration_s=_as_float(params.get("duration_s"), "duration_s") or 14.0,
+        warmup_s=_as_float(params.get("warmup_s"), "warmup_s") or 0.0,
+    )
+
+    vw, vh = 1920, 1080
+    viewport = _as_str(params.get("viewport"))
+    if viewport:
+        vw, vh = _parse_viewport(viewport)
+
+    browser_args = _as_str_list(params.get("browser_args")) + tuple(extra_browser_args)
+
+    cfg = RunConfig(
+        targets=(target,),
+        output_dir=output_dir,
+        capture=capture,
+        headless=True,             # no display in the container
+        concurrency=1,             # one check at a time
+        browser_args=browser_args,
+        viewport_width=vw,
+        viewport_height=vh,
+        nav_timeout_s=_as_float(params.get("nav_timeout_s"), "nav_timeout_s") or 30.0,
+        play_confirm_timeout_s=(
+            _as_float(params.get("play_confirm_timeout_s"), "play_confirm_timeout_s") or 10.0),
+        ad_timeout_s=_as_float(params.get("ad_timeout_s"), "ad_timeout_s") or 15.0,
+        retries=_as_int(params.get("retries"), "retries") or 1,
+        fullscreen=_as_bool(params.get("fullscreen"), True),
+        auto_dismiss_consent=_as_bool(params.get("auto_dismiss_consent"), True),
+    )
+    _validate(cfg)
+    return cfg

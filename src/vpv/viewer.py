@@ -26,6 +26,10 @@ from mimetypes import guess_type
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from .auth import COOKIE_NAME, SESSION_TTL_S, AuthSettings, parse_cookies
+from .errors import ConfigError
+from .jobs import CONTAINER_BROWSER_ARGS, JobManager
+
 VIDEO_EXTS = {".mp4", ".webm", ".mov", ".m4v", ".ogg", ".ogv"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 MEDIA_EXTS = VIDEO_EXTS | IMAGE_EXTS
@@ -184,27 +188,134 @@ def compose(root: Path, inputs: list[Path], height: int = 720) -> Path:
 
 class _Handler(BaseHTTPRequestHandler):
     root: Path = Path(".")
+    auth: AuthSettings | None = None
+    jobs: JobManager | None = None
 
     def log_message(self, fmt, *args):  # quieter than the default
         sys.stderr.write("[vpv-view] " + (fmt % args) + "\n")
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == "/healthz":                      # public: Railway health check
+            self._send_json({"ok": True})
+            return
+        if path == "/api/me":                        # public: drives the login screen
+            self._me()
+            return
+        # Data endpoints (API + media) require a session; the static SPA shell
+        # is public (it holds no data and renders a login screen itself).
+        if (path.startswith("/api/") or path.startswith("/media/")) and not self._is_authed():
+            self._send_json({"error": "unauthorized"}, status=401)
+            return
         if path == "/api/videos":
             self._send_json(api_videos(self.root))
+        elif path == "/api/runs":
+            self._runs_list()
+        elif path.startswith("/api/runs/"):
+            self._run_get(unquote(path[len("/api/runs/"):]))
         elif path.startswith("/media/"):
             self._serve_media(path[len("/media/"):])
+        elif path.startswith("/api/"):
+            self.send_error(404, "Not found")
         else:
             self._serve_app(path)
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path == "/api/compose":
+        if path == "/api/login":                     # public
+            self._login()
+            return
+        if not self._is_authed():
+            self._send_json({"error": "unauthorized"}, status=401)
+            return
+        if path == "/api/logout":
+            self._logout()
+        elif path == "/api/run":
+            self._run_start()
+        elif path == "/api/compose":
             self._compose()
         elif path == "/api/upload":
             self._upload()
         else:
             self.send_error(404, "Not found")
+
+    # --- auth ---
+    def _auth_on(self) -> bool:
+        return bool(self.auth and self.auth.enabled)
+
+    def _is_authed(self) -> bool:
+        if not self._auth_on():
+            return True
+        cookies = parse_cookies(self.headers.get("Cookie"))
+        return self.auth.verify_session(cookies.get(COOKIE_NAME)) is not None
+
+    def _me(self):
+        default_user = self.auth.user if self.auth else "admin"
+        if not self._auth_on():
+            self._send_json({"user": default_user, "authRequired": False})
+            return
+        cookies = parse_cookies(self.headers.get("Cookie"))
+        user = self.auth.verify_session(cookies.get(COOKIE_NAME))
+        if user is None:
+            self._send_json({"authRequired": True, "error": "unauthorized"}, status=401)
+            return
+        self._send_json({"user": user, "authRequired": True})
+
+    def _login(self):
+        body = self._read_json()
+        if body is None:
+            return
+        user = str(body.get("username", ""))
+        pw = str(body.get("password", ""))
+        if not (self.auth and self.auth.check(user, pw)):
+            self._send_json({"error": "invalid credentials"}, status=401)
+            return
+        token = self.auth.make_session(user or self.auth.user)
+        cookie = (f"{COOKIE_NAME}={token}; HttpOnly; SameSite=Lax; Path=/; "
+                  f"Max-Age={SESSION_TTL_S}")
+        self._send_json({"user": user or self.auth.user}, set_cookie=cookie)
+
+    def _logout(self):
+        cookie = f"{COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"
+        self._send_json({"ok": True}, set_cookie=cookie)
+
+    # --- verification runs ---
+    def _run_start(self):
+        body = self._read_json()
+        if body is None:
+            return
+        if self.jobs is None:
+            self._send_json({"error": "runs are not available"}, status=503)
+            return
+        try:
+            job = self.jobs.submit(body)
+        except ConfigError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
+        self._send_json(job.to_dict(), status=202)
+
+    def _runs_list(self):
+        jobs = self.jobs.list() if self.jobs else []
+        self._send_json([j.to_dict() for j in jobs])
+
+    def _run_get(self, job_id: str):
+        job = self.jobs.get(job_id) if self.jobs else None
+        if job is None:
+            self._send_json({"error": "not found"}, status=404)
+            return
+        self._send_json(job.to_dict())
+
+    def _read_json(self) -> dict | None:
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            data = json.loads(self.rfile.read(length) or b"{}")
+        except (json.JSONDecodeError, ValueError):
+            self._send_json({"error": "invalid JSON"}, status=400)
+            return None
+        if not isinstance(data, dict):
+            self._send_json({"error": "expected a JSON object"}, status=400)
+            return None
+        return data
 
     # --- upload (drag files in from the desktop) ---
     def _upload(self):
@@ -274,11 +385,13 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json({"src": _media_url(out, self.root)})
 
     # --- responses ---
-    def _send_json(self, obj, status: int = 200):
+    def _send_json(self, obj, status: int = 200, set_cookie: str | None = None):
         data = json.dumps(obj).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        if set_cookie:
+            self.send_header("Set-Cookie", set_cookie)
         self.end_headers()
         self.wfile.write(data)
 
@@ -398,13 +511,23 @@ def serve(directory: Path, host: str, port: int, open_browser: bool) -> int:
         sys.stderr.write(f"error: not a directory: {directory}\n")
         return 2
     directory.mkdir(parents=True, exist_ok=True)  # create on first run (e.g. an empty volume)
-    handler = type("BoundHandler", (_Handler,), {"root": directory})
+
+    auth = AuthSettings.from_env()
+    # In-container capture needs software rendering + no sandbox (runs as root).
+    extra_args = CONTAINER_BROWSER_ARGS if os.environ.get("VPV_IN_CONTAINER") else ()
+    jobs = JobManager(directory, extra_browser_args=extra_args)
+    handler = type("BoundHandler", (_Handler,),
+                   {"root": directory, "auth": auth, "jobs": jobs})
     httpd = ThreadingHTTPServer((host, port), handler)
     actual_port = httpd.server_address[1]
     url = f"http://{host if host else '127.0.0.1'}:{actual_port}/"
     n = len(find_videos(directory))
     ui = "React UI" if (WEB_DIR / "index.html").is_file() else "fallback UI"
     print(f"VPV viewer ({ui}) serving {n} clip(s) from {directory}")
+    if auth.enabled:
+        print(f"  auth: ENABLED (user '{auth.user}')")
+    else:
+        print("  auth: DISABLED (set VPV_ADMIN_PASSWORD to require login)")
     print(f"  {url}   (Ctrl+C to stop)")
     if open_browser:
         try:
@@ -420,8 +543,31 @@ def serve(directory: Path, host: str, port: int, open_browser: bool) -> int:
     return 0
 
 
+def _load_dotenv(path: Path = Path(".env")) -> None:
+    """Populate os.environ from a local .env (KEY=VALUE per line) if present.
+
+    Existing environment variables win, so a deployment's real env is never
+    overridden. Used for local admin credentials that must not be committed.
+    """
+    if not path.is_file():
+        return
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s:
+                continue
+            key, _, val = s.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = val
+    except OSError:
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    _load_dotenv()
     # Defaults come from the environment so the same entrypoint works locally and
     # on hosts like Railway (which inject PORT and, for us, HOST/VPV_VIEW_DIR).
     default_dir = os.environ.get("VPV_VIEW_DIR", "./vpv-artifacts")
@@ -429,7 +575,9 @@ def main(argv: list[str] | None = None) -> int:
     default_port = int(os.environ.get("PORT", "8000"))
     p = argparse.ArgumentParser(
         prog="vpv-view",
-        description="View captured clips in a vertical, scroll-snapping feed (view-only).",
+        description="VPV control panel: run verification checks, view clips, and "
+                    "compose side-by-side videos (login required when "
+                    "VPV_ADMIN_PASSWORD is set).",
     )
     p.add_argument("--dir", type=Path, default=Path(default_dir),
                    help="Folder to scan for videos (default: $VPV_VIEW_DIR or ./vpv-artifacts).")
